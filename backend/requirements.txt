@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+
+python-jose[cryptography]
+passlib[bcrypt]
+web3>=6,<7
