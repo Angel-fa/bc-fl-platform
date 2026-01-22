@@ -1,20 +1,3 @@
-# streamlit_app.py
-# --------------------------------------------------------------------------------------
-# Streamlit UI (Frontend) για την πλατφόρμα BC-FL.
-#
-# Ρόλος του αρχείου:
-# - Παρέχει Web UI για login/register, διαχείριση nodes, datasets, consents, access requests,
-#   federated jobs και runs/history.
-# - Κάνει HTTP calls στο Backend API (FastAPI) στο DEFAULT_BASE_URL.
-# - Δεν αποθηκεύει “δεδομένα ασθενών” τοπικά στο UI· το UI είναι client που καλεί endpoints.
-#
-# Σημαντικό:
-# - Τα endpoints που καλεί το UI (π.χ. /auth/login, /datasets, /public/consent)
-#   πρέπει να υπάρχουν στο backend κάτω από /api/v1/... (λόγω DEFAULT_BASE_URL).
-# - Η ασφάλεια/έλεγχος πρόσβασης (RBAC) πρέπει να επιβάλλεται στο backend.
-#   Το UI απλώς “κρύβει” σελίδες ανά ρόλο για ευχρηστία.
-# --------------------------------------------------------------------------------------
-
 from __future__ import annotations
 
 import json
@@ -22,7 +5,6 @@ import os
 from typing import Any, Dict, Optional, List
 
 import pandas as pd
-import plotly.express as px
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -31,29 +13,21 @@ import streamlit as st
 from PIL import Image
 
 
-# ----------------------------
-# Configuration
-# ----------------------------
-# Base URL του backend API.
-# - Σε Docker περιβάλλον, το service name "backend" λύνει μέσω Docker DNS.
-# - Το /api/v1 είναι το prefix του κεντρικού router του backend.
 DEFAULT_BASE_URL = os.getenv("API_BASE_URL", "http://backend:8000/api/v1")
+public_docs_url = os.getenv("PUBLIC_BACKEND_DOCS_URL", "http://localhost:8000/docs")
 
-# Timeout για HTTP requests προς backend/agent.
-# Αν backend ή agent αργεί/δεν απαντά, το UI θα κάνει timeout αντί να “κολλήσει”.
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "12"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "12")) # timeout αντί να κολλήσει
 
-# Επιτρεπτοί ρόλοι χρηστών (πρέπει να ταιριάζουν με το backend auth/RBAC).
+# Επιτρεπτοί ρόλοι χρηστών
 ROLES = ["Admin", "Hospital", "Biobank", "Researcher"]
 
-# Σταθερές για dropdowns/forms.
+#  dropdowns
 SENSITIVITY_LEVELS = ["low", "medium", "high"]
 CONSENT_STATUS = ["draft", "active", "retired"]
 REQUEST_STATUSES = ["submitted", "approved", "denied"]
 EXPORT_METHODS = ["federated", "aggregated", "synthetic"]
 
-# Ποιες σελίδες εμφανίζονται σε κάθε ρόλο.
-# (Frontend “navigation filter” — ο πραγματικός έλεγχος πρόσβασης είναι στο backend.)
+# Ποιες σελίδες εμφανίζονται σε κάθε ρόλο
 PAGES_BY_ROLE = {
     "Admin": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
     "Hospital": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
@@ -63,13 +37,6 @@ PAGES_BY_ROLE = {
 
 
 def role_norm() -> str:
-    """
-    Επιστρέφει ρόλο σε “κανονικοποιημένη” μορφή (π.χ. 'hospital' -> 'Hospital').
-
-    Γιατί το χρειαζόμαστε:
-    - Το backend μπορεί να επιστρέψει role με διαφορετικό casing.
-    - Το UI χρησιμοποιεί συγκεκριμένα strings στα PAGES_BY_ROLE και σε checks.
-    """
     r = (st.session_state.get("role") or "").strip()
     mapping = {
         "hospital": "Hospital",
@@ -81,44 +48,21 @@ def role_norm() -> str:
 
 
 def role() -> str:
-    """
-    Επιστρέφει το raw role όπως έχει αποθηκευτεί στο session_state.
-    (Χρησιμοποιείται όταν δεν χρειάζεται κανονικοποίηση.)
-    """
     return st.session_state.get("role", "")
 
 
 def org() -> str:
-    """
-    Επιστρέφει το org του logged-in χρήστη από session_state.
-    Χρησιμοποιείται σε payloads (π.χ. requester_org) και σε εμφανίσεις.
-    """
     return st.session_state.get("org", "")
 
 
-# ----------------------------
 # Helpers
-# ----------------------------
-def _assets_path(filename: str) -> str:
-    """
-    Χτίζει absolute path για files μέσα στο /assets του UI container.
 
-    Γιατί:
-    - Τα logos (π.χ. logo_1.png) αντιγράφονται στο container μέσω ui/Dockerfile
-      (COPY assets /app/assets).
-    - Θέλουμε ένα σταθερό τρόπο να τα βρίσκουμε ανεξάρτητα από working directory.
-    """
+def _assets_path(filename: str) -> str:  # path για files μέσα στο /assets (logo_1.png)
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "assets", filename)
 
 
 def _load_image_optional(path: str) -> Optional[Image.Image]:
-    """
-    Προσπαθεί να φορτώσει μία εικόνα και επιστρέφει None αν αποτύχει.
-
-    Χρήσιμο όταν:
-    - Τα assets μπορεί να λείπουν σε κάποιο build, χωρίς να “σπάσει” όλο το UI.
-    """
     try:
         return Image.open(path)
     except Exception:
@@ -126,14 +70,6 @@ def _load_image_optional(path: str) -> Optional[Image.Image]:
 
 
 def _auth_headers() -> Dict[str, str]:
-    """
-    Δημιουργεί Authorization header αν υπάρχει token στο session.
-    Το backend περιμένει Bearer token (JWT) στο header.
-
-    Αν δεν υπάρχει token:
-    - επιστρέφει empty dict
-    - άρα τα endpoints που απαιτούν auth θα αποτύχουν (όπως πρέπει).
-    """
     token = st.session_state.get("token")
     if not token:
         return {}
@@ -141,13 +77,6 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def api_get(path: str, params: Optional[dict] = None) -> Any:
-    """
-    Wrapper για GET requests προς το backend API.
-
-    - Συνθέτει URL: DEFAULT_BASE_URL + path (π.χ. /datasets).
-    - Περνά auth headers (Bearer token) αν υπάρχει.
-    - Αν backend επιστρέψει error status, σηκώνει RuntimeError ώστε να το δείξουμε στο UI.
-    """
     url = f"{DEFAULT_BASE_URL}{path}"
     r = requests.get(url, params=params or {}, headers=_auth_headers(), timeout=REQUEST_TIMEOUT)
     if r.status_code >= 400:
@@ -156,13 +85,6 @@ def api_get(path: str, params: Optional[dict] = None) -> Any:
 
 
 def api_post(path: str, payload: Optional[dict] = None, params: Optional[dict] = None) -> Any:
-    """
-    Wrapper για POST requests προς το backend API.
-
-    - payload: στέλνεται ως JSON body
-    - params: query parameters (π.χ. ?decision=approved)
-    - Σηκώνει error αν status >= 400.
-    """
     url = f"{DEFAULT_BASE_URL}{path}"
     r = requests.post(url, json=payload or {}, params=params or {}, headers=_auth_headers(), timeout=REQUEST_TIMEOUT)
     if r.status_code >= 400:
@@ -171,14 +93,6 @@ def api_post(path: str, payload: Optional[dict] = None, params: Optional[dict] =
 
 
 def api_patch(path: str, params: Optional[dict] = None, payload: Optional[dict] = None) -> Any:
-    """
-    Wrapper για PATCH requests προς το backend API.
-
-    Χρησιμοποιείται για updates, π.χ.:
-    - /datasets/{id}/features
-    - /access-requests/{id}/decision
-    - /consents/{id}/status
-    """
     url = f"{DEFAULT_BASE_URL}{path}"
     r = requests.patch(url, json=payload, params=params or {}, headers=_auth_headers(), timeout=REQUEST_TIMEOUT)
     if r.status_code >= 400:
@@ -186,57 +100,25 @@ def api_patch(path: str, params: Optional[dict] = None, payload: Optional[dict] 
     return r.json() if r.text else None
 
 
-def log_run(run_type: str, payload: Dict[str, Any]) -> None:
-    """
-    Καταγράφει “ιστορικό ενεργειών” (Runs / History) στο backend.
-
-    Design:
-    - Best-effort: Δεν θέλουμε να αποτύχει όλο το UI αν λείπει το endpoint.
-    - Endpoint που απαιτείται στο backend: POST /api/v1/runs (δηλ. UI call: /runs).
-
-    Γιατί useful:
-    - Σου επιτρέπει να δείχνεις στον καθηγητή “τι έτρεξε” κάθε χρήστης.
-    - Το backend αποθηκεύει run logs σε sqlite (runs table).
-    """
+def log_run(run_type: str, payload: Dict[str, Any]) -> None:  # Καταγράφει “ιστορικό ενεργειών” (Runs / History) στο backend
     try:
         api_post("/runs", payload={"run_type": run_type, "payload": payload})
     except Exception:
-        # Δεν μπλοκάρουμε το UI αν αποτύχει το history logging.
         pass
 
 
-def require_login() -> None:
-    """
-    Guard για σελίδες που απαιτούν authentication.
-
-    Αν δεν υπάρχει token:
-    - δείχνει μήνυμα
-    - σταματά την εκτέλεση της σελίδας (st.stop()).
-    """
+def require_login() -> None: # stop αν δεν δηλωθεί σωστό authentication
     if not st.session_state.get("token"):
         st.info("Please login to continue.")
         st.stop()
 
 
 def _dataset_columns(ds: Dict[str, Any]) -> List[str]:
-    """
-    Επιστρέφει τα columns που έχει επιστρέψει το backend μετά από validate.
-
-    Σημείωση:
-    - Για Hospital, columns υπάρχουν μετά το /validate.
-    - Για Researcher/Biobank, το backend μπορεί να τα “sanitize” (columns=None).
-    """
     cols = ds.get("columns") or []
-    return [str(x) for x in cols if str(x).strip()]
+    return [str(x) for x in cols if str(x).strip()] #  Επιστρέφει τα columns που έχει επιστρέψει το backend μετά από validate.
 
 
 def _dataset_exposed_features(ds: Dict[str, Any]) -> List[str]:
-    """
-    Επιστρέφει τις exposed_features (λίστα features που ο Hospital έχει επιτρέψει).
-
-    Αυτό αποτελεί governance/minimization mechanism:
-    - external roles (Researcher/Biobank) πρέπει να βλέπουν μόνο exposed_features.
-    """
     feats = ds.get("exposed_features")
     if feats is None:
         return []
@@ -246,10 +128,8 @@ def _dataset_exposed_features(ds: Dict[str, Any]) -> List[str]:
 def _features_available_to_requester(ds: Dict[str, Any]) -> List[str]:
     """
     Ορίζει ποια features μπορεί να επιλέξει ο χρήστης όταν δημιουργεί Federated Job.
-
-    Rules:
-    - Για Biobank/Researcher: ΜΟΝΟ exposed_features (privacy-by-design).
-    - Για Hospital/Admin: exposed_features αν υπάρχουν, αλλιώς columns (πιο permissive).
+    - Για Biobank/Researcher: ΜΟΝΟ exposed_features
+    - Για Hospital/Admin: πριν το στάδιο exposed_features
     """
     exposed = _dataset_exposed_features(ds)
     cols = _dataset_columns(ds)
@@ -259,23 +139,9 @@ def _features_available_to_requester(ds: Dict[str, Any]) -> List[str]:
 
 
 def suggest_actions(metrics: dict) -> list[str]:
-    """
-    Προαιρετική (rule-based) συνάρτηση για “recommendations” μετά από job.
-
-    - Αναλύει metrics dictionary που γυρνάει το backend (/fl/jobs/{id}/start).
-    - Παράγει λίστα με ενέργειες (actions) π.χ.:
-      - data quality (missing/outliers)
-      - privacy (suppression / min threshold)
-      - trends/convergence
-      - feature importance
-
-    Note:
-    - Το UI έχει το section “Recommended next actions” σχολιασμένο (disabled).
-    - Μπορεί να ενεργοποιηθεί εύκολα, αν το θες στην παρουσίαση.
-    """
     actions: list[str] = []
 
-    # 1) Data quality: missing rates, outliers, constant features
+    # 1) Data quality
     feature_stats = (metrics.get("feature_metrics") or metrics.get("feature_stats") or {})
     if isinstance(feature_stats, dict) and feature_stats:
         for feat, s in feature_stats.items():
@@ -292,7 +158,7 @@ def suggest_actions(metrics: dict) -> list[str]:
             if s.get("is_constant") is True:
                 actions.append(f"[Data Quality] '{feat}' φαίνεται constant/zero: πρότεινε αφαίρεση feature.")
 
-    # 2) Privacy / governance: suppressed features, threshold rules
+    # 2) Privacy / governance
     privacy = metrics.get("privacy") or {}
     if isinstance(privacy, dict) and privacy:
         thr = privacy.get("min_row_threshold")
@@ -305,11 +171,11 @@ def suggest_actions(metrics: dict) -> list[str]:
         if thr is not None:
             actions.append(f"[Privacy] Ελάχιστο threshold={thr}. Πρότεινε rule: μην εμφανίζεις stats για N<threshold.")
 
-    # 3) Convergence / trends: ύπαρξη round_trends
+    # 3) Rounds μελλοντικά με ml
     trends = metrics.get("round_trends") or {}
     if isinstance(trends, dict) and trends:
         actions.append("[Trends] Υπάρχουν round_trends: δείξε convergence plot ή μείωσε rounds αν συγκλίνει γρήγορα.")
-
+    """
     # 4) Normalized importance: top 3 features
     norm_imp = metrics.get("normalized_importance")
     if isinstance(norm_imp, dict) and norm_imp:
@@ -322,46 +188,29 @@ def suggest_actions(metrics: dict) -> list[str]:
             )
         except Exception:
             pass
-
+    """
+    """
     # Αν δεν βγει τίποτα (π.χ. missing metrics), βάζουμε generic μήνυμα.
     if not actions:
         actions.append(
             "Δεν υπάρχουν αρκετά enriched metrics ακόμη για recommendations. "
             "Τρέξε job με feature_metrics / privacy / trends ενεργά."
         )
-
+    """
     return actions
 
 
-# ----------------------------
-# Flash messages (persist across reruns)
-# ----------------------------
-def flash_set(kind: str, text: str) -> None:
-    """
-    Αποθηκεύει flash message στο session_state.
+# Flash messages
 
-    Γιατί:
-    - Streamlit κάνει rerun συχνά (κάθε interaction).
-    - Θέλουμε να “κρατάμε” ένα μήνυμα (success/error) μέχρι να το δείξουμε.
-    """
+def flash_set(kind: str, text: str) -> None:
     st.session_state["flash_msg"] = {"kind": kind, "text": text}
 
 
 def flash_clear() -> None:
-    """Καθαρίζει το flash message."""
     st.session_state.pop("flash_msg", None)
 
 
 def flash_show() -> None:
-    """
-    Εμφανίζει (αν υπάρχει) το flash message.
-
-    kind:
-    - success -> st.success
-    - warning -> st.warning
-    - error -> st.error
-    - else -> st.info
-    """
     msg = st.session_state.get("flash_msg")
     if not msg:
         return
@@ -377,24 +226,11 @@ def flash_show() -> None:
         st.info(text)
 
 
-# ----------------------------
 # UI: Auth
-# ----------------------------
+
 def ui_login_register() -> None:
-    """
-    Landing UI όταν ο χρήστης ΔΕΝ είναι logged in.
 
-    Περιλαμβάνει:
-    - Login form (POST /auth/login)
-    - Register form (POST /auth/register)
-    - Public Patient Consent portal (POST /public/consent)
-
-    Σημαντικό για Public Consent:
-    - Το UI καλεί api_post("/public/consent")
-    - Άρα backend endpoint πρέπει να είναι: /api/v1/public/consent
-      (δηλ. mounted μέσα στο api router prefix="/api/v1").
-    """
-    st.title("BC-FL Platform")
+    st.title("Πλατφόρμα Συνεργατικής Ιατρικής Ανάλυσης / BC-FL")
     st.markdown("### ")
 
     # Layout για logos (κεντραρισμένα)
@@ -411,9 +247,9 @@ def ui_login_register() -> None:
     # Δύο στήλες: αριστερά login, δεξιά register
     c1, c2 = st.columns(2)
 
-    # -------------------------
+
     # Login
-    # -------------------------
+
     with c1:
         st.subheader("Login")
         username = st.text_input("Username", key="login_username")
@@ -422,11 +258,10 @@ def ui_login_register() -> None:
         # Το κουμπί Login κάνει call στο backend για token.
         if st.button("Login", type="primary"):
             try:
-                # POST /auth/login (backend επιστρέφει access_token + user info)
+
                 resp = api_post("/auth/login", {"username": username, "password": password})
                 st.session_state["token"] = resp["access_token"]
 
-                # Αποθηκεύουμε user claims στο session_state για να αλλάξει UI συμπεριφορά.
                 user = resp["user"]
                 st.session_state["username"] = user["username"]
                 st.session_state["role"] = user["role"]
@@ -434,21 +269,21 @@ def ui_login_register() -> None:
 
                 st.success("Logged in.")
 
-                # Προαιρετική καταγραφή run history
+                # καταγραφή run history
                 log_run("auth.login", {"username": username, "role": user.get("role"), "org": user.get("org")})
 
-                # rerun για να αλλάξει σε “logged in” mode και να ανοίξει navigation.
+                # rerun για να αλλάξει σε logged in  και να ανοίξει navigation
                 st.rerun()
 
             except Exception as e:
-                # Σε αποτυχία login, καθαρίζουμε ευαίσθητα session keys.
+                # Σε αποτυχία login -> clear keys
                 for k in ("token", "username", "role", "org"):
                     st.session_state.pop(k, None)
                 st.error(str(e))
 
-    # -------------------------
+
     # Register
-    # -------------------------
+
     with c2:
         st.subheader("Register")
         r_username = st.text_input("New username", key="reg_username")
@@ -460,7 +295,7 @@ def ui_login_register() -> None:
             placeholder="e.g., Hospital A / Biobank Center / Research Lab",
         )
 
-        # Για Hospital/Biobank απαιτείται invite_code (enforced στο backend register endpoint)
+        # Για Hospital/Biobank απαιτείται invite_code
         invite_code = ""
         if r_role in ("Hospital", "Biobank"):
             invite_code = st.text_input(
@@ -475,7 +310,6 @@ def ui_login_register() -> None:
                 if r_role in ("Hospital", "Biobank"):
                     payload["invite_code"] = invite_code
 
-                # POST /auth/register
                 api_post("/auth/register", payload)
 
                 st.success("Registered. You can now login.")
@@ -484,12 +318,10 @@ def ui_login_register() -> None:
             except Exception as e:
                 st.error(str(e))
 
-    # Οπτικός διαχωρισμός πριν το public patient portal
     st.divider()
 
-    # -------------------------
+
     # Public Patient Consent
-    # -------------------------
     st.subheader("Patient Consent (Public Portal)")
     patient_id = st.text_input("Patient Pseudonymous ID (e.g., PAT-0001)", key="pt_patient_id")
     dataset_id = st.text_input("Dataset ID", key="pt_dataset_id", help="Paste the dataset_id you were given.")
@@ -501,9 +333,7 @@ def ui_login_register() -> None:
         help="Set PATIENT_PORTAL_SECRET in backend env.",
     )
 
-    # Όταν πατηθεί Submit:
-    # - καλεί POST /public/consent στο backend (μέσα στο /api/v1)
-    # - backend κάνει validation secret και καταγράφει consent (σύμφωνα με patient_consent_routes.py)
+    # Όταν πατηθεί Submit
     if st.button("Submit Consent", key="pt_submit", type="primary"):
         try:
             payload = {
@@ -518,18 +348,10 @@ def ui_login_register() -> None:
             st.error(str(e))
 
 
-def ui_topbar() -> None:
-    """
-    Top bar που εμφανίζεται ΠΑΝΤΑ (στην αρχή του main).
-
-    Περιέχει:
-    - ένδειξη backend URL
-    - στοιχεία χρήστη (username/role/org) όταν είναι logged in
-    - κουμπί logout που καθαρίζει το session_state
-    """
+def ui_topbar() -> None: # πάνω τμήμα της σελίδας όταν συνδεθείς
     c1, c2, c3 = st.columns([3, 2, 1])
     with c1:
-        st.caption(f"Backend: {DEFAULT_BASE_URL}")
+        st.markdown("[API Docs](http://localhost:8000/docs)")
     with c2:
         if st.session_state.get("token"):
             st.write(
@@ -539,21 +361,14 @@ def ui_topbar() -> None:
     with c3:
         if st.session_state.get("token"):
             if st.button("Logout"):
-                # Καθαρίζει όλα τα keys (token, role, org, etc.)
                 st.session_state.clear()
                 st.rerun()
 
 
-# ----------------------------
+
 # Pages
-# ----------------------------
+
 def page_dashboard() -> None:
-    """
-    Dashboard page:
-    - εμφανίζει logos
-    - επιβεβαιώνει ότι backend είναι “alive” (GET /health)
-    - δείχνει συνοπτική περιγραφή του PoC flow
-    """
     st.header("Dashboard")
     f1, f2, f3 = st.columns([1, 3, 1])
     with f2:
@@ -570,18 +385,16 @@ def page_dashboard() -> None:
     require_login()
     flash_show()
 
-    # Health check προς backend API (/api/v1/health)
     try:
-        health = api_get("/health")
+        health = api_get("/health")  # Health check προς backend API
         st.success(f"Backend status: {health.get('status', 'unknown')}")
     except Exception as e:
         st.error(str(e))
 
-    # Περιγραφή του concept: federated-only descriptors (no raw data transfer)
     st.write(
         """
 This platform supports federated-only descriptors:
-- Hospitals register dataset descriptors (pointers) to local files hosted by their agents.
+- Hospitals register dataset descriptors to local files hosted by their agents.
 - Biobanks and Researchers request access.
 - Hospitals approve/deny.
 - Approved parties can run federated jobs (no raw data transfer).
@@ -590,16 +403,10 @@ This platform supports federated-only descriptors:
 
 
 def page_nodes() -> None:
-    """
-    Nodes page:
-    - εμφανίζει registered Hospital Agents (GET /nodes)
-    - χρήσιμο για να δεις ότι ο agent έκανε registration επιτυχώς.
-    """
     st.header("Nodes (Hospital Agents)")
     require_login()
     flash_show()
 
-    st.caption("Nodes are registered once and persisted in the platform database. You do NOT need to re-register unless you reset the DB.")
     try:
         nodes = api_get("/nodes")
     except Exception as e:
@@ -613,29 +420,17 @@ def page_nodes() -> None:
     st.write("Registered nodes:")
     st.dataframe(nodes, width="stretch")
 
-    # Hint για Docker DNS / base_url σωστό format
+
     if role_norm() == "Hospital":
         st.caption("If you changed Docker compose service names, ensure node.base_url matches the internal Docker DNS name (e.g., http://bc-fl-hospital-a-agent:9001).")
 
 
 def page_datasets() -> None:
-    """
-    Datasets page:
-    - Για Hospital:
-      1) Upload dataset file στο agent (POST {agent}/upload)
-      2) Create dataset descriptor στο backend (POST /datasets)
-      3) Validate descriptor (POST /datasets/{id}/validate) για να πάρεις columns/row_count
-      4) Expose features (PATCH /datasets/{id}/features) για external visibility
-    - Για άλλους ρόλους:
-      - βλέπουν list descriptors (GET /datasets) με τα αντίστοιχα restrictions.
-    """
-    st.header("Datasets (Descriptors)")
+    st.header("Datasets Descriptors")
     require_login()
     flash_show()
 
-    # -------------------------
-    # Hospital-only: Create dataset descriptor
-    # -------------------------
+    # Hospital-only -> Create dataset descriptor
     if role_norm() == "Hospital":
         st.subheader("Create dataset descriptor")
         try:
@@ -648,12 +443,12 @@ def page_datasets() -> None:
         if not nodes:
             st.warning("No nodes available. Register nodes first.")
         else:
-            # Dropdown επιλογής node
+            # Dropdown
             node_opts = {f"{n['name']} ({n['org']})": n["node_id"] for n in nodes}
             selected_node_label = st.selectbox("Hosting node", list(node_opts.keys()), key="ds_host_node_sel")
             selected_node_id = node_opts[selected_node_label]
 
-            # Φόρμα metadata του descriptor (όχι το actual file)
+            # Φόρμα metadata του descriptor (όχι το πραγματκό file)
             name = st.text_input("Name", value="Admissions Dataset", key="ds_name")
             description = st.text_area(
                 "Description",
@@ -663,7 +458,6 @@ def page_datasets() -> None:
             sensitivity = st.selectbox("Sensitivity", SENSITIVITY_LEVELS, index=0, key="ds_sens")
             schema_id = st.text_input("Schema ID", value="admissions_v1", key="ds_schema")
 
-            # File uploader: το αρχείο θα σταλεί στο agent (όχι στο backend)
             uploaded = st.file_uploader("Attach dataset file (CSV or Excel)", type=["csv", "xlsx"], key="ds_uploader")
 
             if uploaded is not None:
@@ -672,11 +466,10 @@ def page_datasets() -> None:
                 # 1) Upload file στο agent
                 if st.button("Upload to hosting node", type="secondary", key="ds_upload_btn"):
                     try:
-                        # Βρίσκουμε το selected node info
+
                         node = next(n for n in nodes if str(n["node_id"]) == str(selected_node_id))
                         agent_base = node["base_url"].rstrip("/")
 
-                        # multipart/form-data upload προς agent /upload
                         files = {"file": (uploaded.name, uploaded.getvalue())}
                         r = requests.post(
                             f"{agent_base}/upload",
@@ -687,17 +480,17 @@ def page_datasets() -> None:
                         if r.status_code >= 400:
                             raise RuntimeError(f"Upload failed: {r.status_code} {r.text}")
 
-                        # Ο agent επιστρέφει local_uri (path μέσα στο agent container)
+                        # Ο agent επιστρέφει local_uri
                         st.session_state["uploaded_local_uri"] = r.json().get("local_uri", "")
                         st.success(f"Uploaded to: {st.session_state['uploaded_local_uri']}")
                     except Exception as e:
                         st.error(str(e))
 
-            # 2) Local URI (read-only) μετά το upload
+            # 2) Local URI read -> upload
             local_uri = st.session_state.get("uploaded_local_uri", "")
             st.text_input("Local URI (inside agent container)", value=local_uri, disabled=True, key="ds_local_uri")
 
-            # 3) Create descriptor στο backend (/datasets)
+            # 3) Create descriptor στο backend
             if st.button("Create descriptor", type="primary", key="ds_create_btn"):
                 try:
                     if not local_uri:
@@ -716,7 +509,7 @@ def page_datasets() -> None:
                     ds = api_post("/datasets", payload)
                     st.success("Descriptor created.")
 
-                    # Καταγραφή run (history)
+                    # Καταγραφή -> history
                     log_run(
                         "datasets.create",
                         {
@@ -732,9 +525,9 @@ def page_datasets() -> None:
 
         st.divider()
 
-    # -------------------------
+
     # List datasets (όλοι οι ρόλοι)
-    # -------------------------
+
     st.subheader("List datasets")
     try:
         datasets = api_get("/datasets")
@@ -748,16 +541,15 @@ def page_datasets() -> None:
 
     st.dataframe(datasets, width="stretch")
 
-    # -------------------------
-    # Hospital-only: Validate + Expose features
-    # -------------------------
+
+    # Hospital only -->  Validate + Expose features
     if role_norm() == "Hospital":
         st.subheader("Validate dataset descriptor")
         ds_map = {f"{d['name']} | {d['dataset_id']}": d["dataset_id"] for d in datasets}
         selected_label = st.selectbox("Select dataset", list(ds_map.keys()), key="ds_validate_sel")
         selected_id = ds_map[selected_label]
 
-        # Validate call στο backend: backend καλεί agent /validate και αποθηκεύει columns/row_count
+        # Validate
         if st.button("Validate", type="secondary", key="ds_validate_btn"):
             try:
                 ds = api_post(f"/datasets/{selected_id}/validate", payload={})
@@ -776,7 +568,6 @@ def page_datasets() -> None:
             except Exception as e:
                 st.error(str(e))
 
-        # Παίρνουμε το τρέχον dataset record από τη λίστα
         ds_current = next((d for d in datasets if str(d.get("dataset_id")) == str(selected_id)), None)
         if not ds_current:
             st.info("Select a dataset above.")
@@ -810,18 +601,12 @@ def page_datasets() -> None:
 
 
 def page_consents() -> None:
-    """
-    Consent Policies page:
-    - Hospital-only
-    - Δημιουργεί policy (POST /consents)
-    - Λιστάρει policies (GET /consents)
-    """
     st.header("Consent Policies")
     require_login()
     flash_show()
 
     if role_norm() != "Hospital":
-        st.info("Consent management is Hospital-only in this PoC.")
+        st.info("Consent management is Hospital only")
         return
 
     try:
@@ -883,19 +668,12 @@ def page_consents() -> None:
 
 
 def page_access_requests() -> None:
-    """
-    Access Requests page:
-    - Researcher/Biobank: υποβάλλουν request (POST /access-requests)
-    - Όλοι: βλέπουν requests (GET /access-requests)
-    - Hospital: εγκρίνει/απορρίπτει (PATCH /access-requests/{id}/decision)
-    """
     st.header("Access Requests")
     require_login()
     flash_show()
 
-    # -------------------------
-    # External roles: Submit access request
-    # -------------------------
+
+    # Submit access request
     if role_norm() in ("Researcher", "Biobank"):
         st.subheader("Submit access request")
         try:
@@ -941,9 +719,9 @@ def page_access_requests() -> None:
 
         st.divider()
 
-    # -------------------------
+
     # List access requests
-    # -------------------------
+
     st.subheader("List access requests")
     try:
         items = api_get("/access-requests")
@@ -957,9 +735,9 @@ def page_access_requests() -> None:
 
     st.dataframe(items, width="stretch")
 
-    # -------------------------
-    # Hospital-only: Approve / Deny
-    # -------------------------
+
+    # Hospital -> Approve / Deny
+
     if role_norm() == "Hospital":
         st.subheader("Approve / Deny")
         req_map = {
@@ -977,7 +755,6 @@ def page_access_requests() -> None:
             on_change=flash_clear,
         )
 
-        # PATCH decision στο backend
         if st.button("Apply decision", type="secondary"):
             try:
                 updated = api_patch(
@@ -1002,21 +779,7 @@ def page_access_requests() -> None:
 
 
 def _is_request_approved_for_user(dataset_id: str) -> bool:
-    """
-    Client-side check (PoC) για να εμποδίσει Researcher/Biobank να τρέξει job
-    αν δεν έχει approved access request.
 
-    Πώς δουλεύει:
-    - Κάνει GET /access-requests
-    - Βρίσκει request με:
-      - ίδιο dataset_id
-      - status == approved
-      - requested_by == current username
-    - Αν υπάρχει, επιστρέφει True.
-
-    Σημαντικό:
-    - Αυτό είναι “UI safeguard”. Η πραγματική ασφάλεια πρέπει να μπει στο backend.
-    """
     if role_norm() not in ("Researcher", "Biobank"):
         return True
 
@@ -1037,113 +800,69 @@ def _is_request_approved_for_user(dataset_id: str) -> bool:
 
 
 def page_federated_jobs() -> None:
-    """
-    Σελίδα "Federated Jobs" (Streamlit UI).
 
-    Τι κάνει συνολικά:
-    1) Εμφανίζει φόρμα δημιουργίας Federated Job (create job)
-    2) Εμφανίζει φόρμα εκκίνησης Federated Job (run/start job)
-    3) Μετά το run, εμφανίζει αποτελέσματα (global_model + metrics)
-       και επιπλέον sections (privacy, feature metrics, trends, correlation matrix)
-       ανάλογα με τις επιλογές του χρήστη.
-
-    Σημαντικό (αρχιτεκτονική):
-    - Η εκτέλεση (train_round, aggregates, metrics) γίνεται στον Hospital Agent.
-    - Το Streamlit καλεί ΜΟΝΟ backend endpoints:
-        - GET /datasets
-        - POST /fl/jobs
-        - POST /fl/jobs/{job_id}/start
-    - Κανένα raw dataset δεν φεύγει από το νοσοκομειακό περιβάλλον (PoC αρχή).
-    """
-    # Τίτλος σελίδας
     st.header("Federated Jobs")
 
-    # Guard: αν δεν υπάρχει token, σταματάει τη σελίδα και ζητά login
-    require_login()
+    require_login()      # αν δεν υπάρχει token, σταματάει τη σελίδα και ζητά login
 
-    # Εμφανίζουμε τυχόν flash message από προηγούμενη ενέργεια
     flash_show()
 
-    # Περιγραφικό κείμενο για τον χρήστη (UX)
     st.caption(
         "This Platform runs federated computation against the hosting Hospital Agent. "
         "No raw dataset leaves the hospital boundary."
     )
 
-    # Φορτώνουμε datasets από το backend
-    # Αν αποτύχει (π.χ. backend down / auth failure), εμφανίζουμε error και σταματάμε
+
     try:
         datasets = api_get("/datasets")
     except Exception as e:
         st.error(str(e))
         return
 
-    # Αν δεν υπάρχουν datasets, δεν μπορούμε να δημιουργήσουμε job
     if not datasets:
         st.warning("No datasets available.")
         return
 
-    # -------------------------
     # Create job
-    # -------------------------
-    # UI section για δημιουργία νέου Federated Job
+
     st.subheader("Create job")
 
-    # Δημιουργούμε mapping από "φιλικό label" -> dataset_id
-    # ώστε ο χρήστης να επιλέγει εύκολα dataset από dropdown,
-    # αλλά εμείς να κρατάμε ως πραγματική τιμή το dataset_id.
-    ds_map = {
+    ds_map = {      # Δημιουργούμε mapping από "φιλικό label" -> dataset_id
         f"{d['name']} | owner={d['owner_org']} | {d['dataset_id']}": d["dataset_id"]
         for d in datasets
     }
 
-    # Dropdown επιλογής dataset
-    ds_sel = st.selectbox("Dataset", list(ds_map.keys()))
+    ds_sel = st.selectbox("Dataset", list(ds_map.keys())) # Dropdown επιλογής dataset
 
-    # Πραγματική τιμή dataset_id που θα στείλουμε στο backend
-    dataset_id = ds_map[ds_sel]
+    dataset_id = ds_map[ds_sel]      # Πραγματική τιμή dataset_id που θα στείλουμε στο backend
 
-    # Παίρνουμε ολόκληρο το dataset record (dict) που αντιστοιχεί στο dataset_id
-    # Χρήσιμο για να βρούμε columns/exposed_features και να κάνουμε feature selection.
+
     ds_current = next(
         (d for d in datasets if str(d.get("dataset_id")) == str(dataset_id)),
         None,
     )
 
-    # Ο χρήστης επιλέγει αριθμό rounds (iteration steps) για το PoC job
     rounds = st.number_input("Rounds", min_value=1, max_value=50, value=3, step=1)
 
-    # Frontend-level guard: μόνο συγκεκριμένοι ρόλοι μπορούν να δημιουργούν jobs.
-    # (Το backend έχει επίσης RBAC — αυτό είναι απλώς UX safety.)
     if role_norm() not in ("Researcher", "Biobank", "Hospital"):
         st.error("Only Hospital, Researcher and Biobank can create FL jobs.")
         st.stop()
 
-    # Επιλογή διαθέσιμων features:
-    # - Researcher/Biobank βλέπουν μόνο exposed_features
-    # - Hospital/Admin βλέπουν exposed_features αν υπάρχουν, αλλιώς columns
     available_features = _features_available_to_requester(ds_current or {})
 
-    # Multiselect για επιλογή χαρακτηριστικών (features)
-    # default: τα 2 πρώτα αν υπάρχουν, αλλιώς όσα υπάρχουν
     selected_features = st.multiselect(
         "Features (select one or more)",
         options=available_features,
         default=available_features[:2] if len(available_features) >= 2 else available_features,
     )
 
-    # (Προαιρετικό) label field (π.χ. target variable)
     label = st.text_input("Label (optional)", value="")
 
-    # (Σημειώσεις) για καταγραφή σκοπού job
-    notes = st.text_area("Notes", value="Compute federated statistics (PoC).")
+    notes = st.text_area("Notes", value="Compute federated statistics.")
 
-    # Κουμπί δημιουργίας job
-    if st.button("Create FL Job", type="primary"):
+
+    if st.button("Create FL Job", type="primary"): # Κουμπί δημιουργίας job
         try:
-            # Για Researcher/Biobank απαιτούμε προηγούμενο APPROVED access request
-            # Αυτό δεν είναι το "real" security layer (backend κάνει RBAC),
-            # αλλά είναι χρήσιμο UI check ώστε να μην τρέχει άδικα.
             if not _is_request_approved_for_user(dataset_id):
                 st.error(
                     "You need an APPROVED access request for this dataset "
@@ -1151,13 +870,11 @@ def page_federated_jobs() -> None:
                 )
                 st.stop()
 
-            # Validation: πρέπει να έχει επιλεγεί τουλάχιστον 1 feature
             if not selected_features:
-                st.error("Select at least one feature.")
+                st.error("Select at least one feature.")     # Validation: πρέπει να έχει επιλεγεί τουλάχιστον 1 feature
                 st.stop()
 
-            # Payload που θα σταλεί στο backend endpoint POST /fl/jobs
-            payload = {
+            payload = {             # Payload που θα σταλεί στο backend endpoint
                 "dataset_id": dataset_id,
                 "rounds": int(rounds),
                 "features": selected_features,
@@ -1165,14 +882,10 @@ def page_federated_jobs() -> None:
                 "notes": notes,
             }
 
-            # Δημιουργία job στο backend (επιστρέφει FLJob record)
-            job = api_post("/fl/jobs", payload)
+            job = api_post("/fl/jobs", payload)  # Δημιουργία job στο backend (επιστρέφει FLJob record)
 
-            # UX feedback: επιτυχία + εμφανίζουμε job_id
             st.success(f"Job created: {job.get('job_id')}")
 
-            # Logging στο history σύστημα (backend /runs)
-            # Best-effort: αν δεν υπάρχει endpoint, δεν "σπάει" το UI.
             log_run(
                 "fl_jobs.create",
                 {
@@ -1183,27 +896,18 @@ def page_federated_jobs() -> None:
                 },
             )
 
-            # Κρατάμε το τελευταίο job_id στο session για να το προτείνουμε στο "Run job"
             st.session_state["last_job_id"] = job.get("job_id")
 
-            # st.rerun(): επαναφόρτωση Streamlit script ώστε να ανανεωθεί η σελίδα
-            # (π.χ. να εμφανιστεί έτοιμο το job_id input με τη νέα τιμή)
             st.rerun()
 
         except Exception as e:
-            # Αν backend επέστρεψε error ή υπάρχει network issue
             st.error(str(e))
 
-    # -------------------------
     # Run job
-    # -------------------------
-    # UI section για εκκίνηση job που έχει ήδη δημιουργηθεί
+
     st.divider()
     st.subheader("Run job")
 
-    # Επιλογές εμφάνισης (display controls):
-    # Ο χρήστης επιλέγει ποια sections θα δει στα αποτελέσματα
-    # πριν πατήσει Start job, ώστε να μην χρειάζεται να τρέχει ξανά.
     st.subheader("Display options")
     sections = st.multiselect(
         "Select which analytics sections to display",
@@ -1224,14 +928,12 @@ def page_federated_jobs() -> None:
         key="fl_display_sections",
     )
 
-    # Input για job_id:
-    # - default: τελευταίο job_id που δημιουργήσαμε (session_state["last_job_id"])
+
     job_id = st.text_input(
         "Job ID",
         value=st.session_state.get("last_job_id", "") or ""
     )
 
-    # Κουμπί Start job: καλεί backend endpoint POST /fl/jobs/{job_id}/start
     if st.button("Start job", type="secondary"):
         try:
             # Validation: δεν πρέπει να είναι κενό
@@ -1239,115 +941,93 @@ def page_federated_jobs() -> None:
                 st.error("Provide a Job ID.")
                 st.stop()
 
-            # Εκκίνηση job στο backend
-            # Το backend θα orchestrate τα rounds και θα καλέσει agent /train_round
             job = api_post(f"/fl/jobs/{job_id.strip()}/start", payload={})
 
-            # UX feedback: επιτυχής ολοκλήρωση + status και round
             st.success(
                 f"Job finished: status={job.get('status')}, "
                 f"round={job.get('current_round')}"
             )
 
-            # -------------------------
-            # Core outputs
-            # -------------------------
-            # Global model / aggregated outputs (PoC: συνήθως federated statistics)
+            #  outputs
+            # Global model / aggregated outputs (για τωρα συνήθως federated statistics)
             st.subheader("Federated Aggregates (Global)")
             st.json(job.get("global_model") or {})
 
-            # Execution metrics (dictionary): privacy, feature_metrics, round_trends, correlation_matrix, κ.λπ.
+            # Execution metrics
             st.subheader("Execution Metrics")
             metrics = job.get("metrics") or {}
             st.json(metrics)
 
-            # Αν το backend κατέγραψε last_error, το εμφανίζουμε στο UI
             if job.get("last_error"):
                 st.error(job.get("last_error"))
 
-            # -------------------------
-            # Enriched analytics (display controls)
-            # -------------------------
+            # Enriched analytics
 
             # 1) Privacy / Governance
-            # Περιλαμβάνει policy thresholds (π.χ. min_row_threshold) και suppressed_features
             privacy = metrics.get("privacy") or {}
             if "Privacy / Governance" in sections and privacy:
                 st.subheader("Privacy / Governance")
                 st.json(privacy)
 
-            # 2) Feature metrics (distribution + data quality)
-            # Περιμένουμε dict: feature -> stats (missing_rate, outlier_rate, mean, std, κ.λπ.)
+            # 2) Feature metrics
             feature_metrics = metrics.get("feature_metrics") or metrics.get("feature_stats") or {}
             if "Feature Metrics (Distribution & Data Quality)" in sections and feature_metrics:
                 st.subheader("Feature Metrics (Distribution & Data Quality)")
                 try:
-                    # Μετατρέπουμε σε DataFrame για καλύτερη ανάγνωση
-                    fm_df = (
+
+                    fm_df = (    # Μετατρέπουμε σε DataFrame για καλύτερη ανάγνωση
                         pd.DataFrame.from_dict(feature_metrics, orient="index")
                         .reset_index()
                         .rename(columns={"index": "feature"})
                     )
                     st.dataframe(fm_df, width="stretch")
                 except Exception:
-                    # Fallback: αν κάτι δεν πάει καλά, εμφανίζουμε raw json
                     st.json(feature_metrics)
 
-            # 3) Normalized importance (variance-based proxy)
-            # PoC: δείχνει ποια features έχουν μεγαλύτερη συμβολή/διακύμανση
+            # 3) Normalized importance
             norm_imp = metrics.get("normalized_importance")
             if "Normalized Importance" in sections and norm_imp:
-                st.subheader("Normalized Feature Importance (Variance-based Proxy)")
+                st.subheader("Normalized Feature Importance")
                 st.json(norm_imp)
 
-            # 4) Round trends (convergence)
+            # 4) Round trends
             # Συνήθως dict: feature_mean -> [values per round]
             round_trends = metrics.get("round_trends")
             if "Round Trends" in sections and round_trends:
-                st.subheader("Round Trends (Convergence)")
+                st.subheader("Round Trends")
                 st.json(round_trends)
 
             # 5) Correlation matrix (Pearson)
-            # metrics["correlation_matrix"] πρέπει να είναι matrix-like dict/list
             corr = metrics.get("correlation_matrix")
             if "Correlation Matrix" in sections and corr:
                 st.subheader("Federated Correlation Matrix (Pearson)")
 
-                # Μετατρέπουμε correlation matrix σε pandas DataFrame
-                corr_df = pd.DataFrame(corr).astype(float)
+                corr_df = pd.DataFrame(corr).astype(float) # Μετατρέπουμε correlation matrix σε pandas DataFrame
 
-                # Διασφαλίζουμε ότι τα rows/cols έχουν την ίδια σειρά
-                corr_df = corr_df.reindex(index=corr_df.columns, columns=corr_df.columns)
+                corr_df = corr_df.reindex(index=corr_df.columns, columns=corr_df.columns)  # Διασφαλίζουμε ότι τα rows/cols έχουν την ίδια σειρά
 
-                # ---- Size control: προσαρμόζουμε μέγεθος figure ανάλογα με αριθμό features ----
                 n = len(corr_df.columns)
                 fig_w = min(8.0, max(4.5, 0.55 * n))
                 fig_h = min(6.0, max(3.8, 0.55 * n))
                 fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-                # ---- Auto color scaling ----
-                # Στόχος: να φαίνεται σωστά το gradient ακόμα και αν οι συσχετίσεις είναι μικρές.
                 vals = corr_df.values.copy()
                 np.fill_diagonal(vals, np.nan)  # αγνοούμε diagonal=1.0 για scaling
                 max_abs = np.nanmax(np.abs(vals))
                 if not np.isfinite(max_abs) or max_abs == 0:
                     max_abs = 1.0
 
-                # Καθορίζουμε color range [-v, v]
-                # Το floor 0.10 βοηθά να μη βγαίνει "άχρωμο" όταν οι τιμές είναι πολύ μικρές
                 v = max(0.10, float(max_abs))
 
-                # Heatmap με colormap coolwarm (αρνητικά -> μπλε, θετικά -> κόκκινο)
                 im = ax.imshow(corr_df.values, vmin=-v, vmax=v, cmap="coolwarm", aspect="equal")
 
-                # Ticks + labels
                 ax.set_xticks(np.arange(n))
                 ax.set_yticks(np.arange(n))
                 ax.set_xticklabels(corr_df.columns, rotation=45, ha="right", fontsize=8)
                 ax.set_yticklabels(corr_df.index, fontsize=8)
                 ax.tick_params(top=False, bottom=True, labeltop=False, labelbottom=True)
 
-                # ---- Annotations: γράφουμε τις τιμές μέσα στα κελιά ----
+                # γράφουμε τις τιμές μέσα στα κελιά
                 vals2 = corr_df.values
                 for i in range(n):
                     for j in range(n):
@@ -1364,7 +1044,6 @@ def page_federated_jobs() -> None:
 
                 fig.tight_layout()
 
-                # Προβολή του matplotlib figure στο Streamlit
                 st.pyplot(fig, use_container_width=False)
 
             """
@@ -1378,19 +1057,10 @@ def page_federated_jobs() -> None:
                     #st.write(f"- Δεν μπόρεσα να υπολογίσω recommendations. ({e})")
             """
         except Exception as e:
-            # Αν backend/agent έβγαλε error, το εμφανίζουμε
             st.error(str(e))
 
 
 def page_runs_history() -> None:
-    """
-    Σελίδα Runs / History.
-
-    Τι κάνει:
-    - Ζητά από backend τα runs του τρέχοντος χρήστη (mine=1)
-    - Εμφανίζει κάθε run σε expander
-    - Παρέχει download JSON για τεκμηρίωση/traceability (audit-like χρήση)
-    """
     st.header("Runs / History")
     require_login()
     flash_show()
@@ -1431,13 +1101,6 @@ def page_runs_history() -> None:
 
 
 def page_settings() -> None:
-    """
-    Σελίδα Settings.
-
-    Τι κάνει:
-    - Εμφανίζει πληροφορίες για backend URL (runtime config)
-    - Εμφανίζει debug info για session (username/role/org/token_present)
-    """
     st.header("Settings")
     require_login()
     flash_show()
@@ -1458,27 +1121,15 @@ def page_settings() -> None:
 
 
 def main() -> None:
-    """
-    Main entrypoint της Streamlit εφαρμογής.
 
-    Ροή:
-    1) Θέτουμε page config και topbar
-    2) Αν δεν υπάρχει token -> εμφανίζουμε login/register UI
-    3) Αν υπάρχει token -> sidebar navigation βάσει ρόλου
-    4) Route σελίδας (Dashboard, Nodes, Datasets, κ.λπ.)
-    """
-    # Βασικό configuration της σελίδας (τίτλος + layout)
     st.set_page_config(page_title="BC-FL Platform", layout="wide")
 
-    # Top bar: backend URL + user info + logout
     ui_topbar()
 
-    # Αν δεν έχει γίνει login, δείχνουμε μόνο την auth οθόνη
     if not st.session_state.get("token"):
         ui_login_register()
         return
 
-    # Σελίδες που επιτρέπονται βάσει ρόλου
     pages = PAGES_BY_ROLE.get(role_norm(), ["Dashboard", "Settings"])
 
     # Sidebar navigation
@@ -1507,8 +1158,5 @@ def main() -> None:
         st.write("Unknown page.")
 
 
-# Standard Python entrypoint guard
-# Όταν τρέχουμε το αρχείο ως script (streamlit run streamlit_app.py),
-# εκτελείται το main().
 if __name__ == "__main__":
     main()

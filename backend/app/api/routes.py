@@ -1,27 +1,4 @@
-# backend/app/api/routes.py
 from __future__ import annotations
-
-"""
-Κεντρικός router της πλατφόρμας BC-FL (Backend API).
-
-Τι κάνει αυτό το αρχείο:
-- Ορίζει ένα APIRouter με prefix="/api/v1" (άρα όλα τα endpoints ξεκινούν από /api/v1)
-- Κάνει include (router.include_router) σε άλλα routers (auth, admin, κ.λπ.)
-- Περιέχει endpoints “core” της πλατφόρμας:
-  - Nodes (agents) register/list/heartbeat
-  - Dataset descriptors (create/list/get/validate/features)
-  - Consent Policies (create/list/active/status)
-  - Access Requests (create/list/decide)
-  - Federated Jobs (create/start/get)
-  - Runs/History (create/list)
-  - Audit (list)
-  - Blockchain receipts (list)
-
-Σημείωση κρίσιμη:
-- Αν ένα router (π.χ. patient_consent_routes.py) δεν γίνει include εδώ,
-  τότε τα endpoints του ΔΕΝ θα είναι προσβάσιμα μέσω του API.
-  (Ισχύει: FastAPI “βλέπει” endpoints μόνο από routers που είναι mounted στο app.)
-"""
 
 import json
 import os
@@ -31,22 +8,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-# Actor = τα claims του χρήστη (username/role/org) όπως προκύπτουν από token
-
-# Include routers
 from app.routes.auth_routes import router as auth_router
 from app.routes.admin_routes import router as admin_router
 from app.routes.patient_consent_routes import router as patient_consent_router
-# Blockchain service: είτε Noop είτε Web3, ανάλογα με env BC_ENABLED
 from app.services.blockchain_service import get_blockchain, sha256_hex
-
-# Store layer (SQLite persistent storage)
 from app.services.sqlite_store import get_store
 
-# RBAC helpers
 from app.auth import Actor, require_roles, ROLE_BIOBANK, ROLE_HOSPITAL, ROLE_RESEARCHER
 
-# Pydantic domain schemas (data models) για responses/requests
 from app.schemas.domain import (
     AccessRequest,
     AccessRequestCreate,
@@ -69,57 +38,30 @@ from app.schemas.domain import (
     RunCreate,
 )
 
-# Δημιουργούμε κεντρικό APIRouter.
-# prefix="/api/v1" σημαίνει ότι όλα τα endpoints θα είναι κάτω από /api/v1/...
+
 router = APIRouter(prefix="/api/v1")
 
-# Κάνουμε include τα routers:
-# - /api/v1/auth/...
-# - /api/v1/admin/...
 router.include_router(auth_router, prefix="/auth", tags=["auth"])
 router.include_router(admin_router, prefix="/admin", tags=["admin"])
 router.include_router(patient_consent_router, tags=["patient-consent"])
-# Σημαντικό:
-# Αν θέλουμε endpoints από άλλο αρχείο (π.χ. patient_consent_routes.py),
-# πρέπει να κάνουμε:
-#   router.include_router(patient_consent_router, tags=[...])
-# αλλιώς ΔΕΝ θα εκτεθεί στο API.
 
 
-# -------------------------
-# Debug marker
-# -------------------------
+# Debug
+
 @router.get("/debug/version", tags=["core"])
 def debug_version():
-    """
-    Debug endpoint ώστε να επιβεβαιώνεις ότι τρέχει ο σωστός κώδικας routes.py.
-    Χρήσιμο όταν έχεις πολλαπλά builds/containers και φοβάσαι caching.
-    """
     return {"routes_version": "routes-2026-01-11-fljobs-hospital-enabled"}
 
 
-# -------------------------
 # Config
-# -------------------------
-# Shared secret για registration/calls προς τον agent.
-# - Ο agent στο /nodes/register και στα agent endpoints απαιτεί αυτό το secret.
+
 AGENT_REG_SECRET = os.getenv("AGENT_REG_SECRET", "dev-secret")
 
-# Timeout για calls προς agent (π.χ. /validate, /train_round)
 AGENT_CALL_TIMEOUT = float(os.getenv("AGENT_CALL_TIMEOUT", "8"))
 
 
 def _http_json_post(url: str, payload: dict, headers: Optional[dict] = None, timeout: float = 8.0) -> dict:
-    """
-    Βοηθητική συνάρτηση για HTTP POST με JSON payload προς agent.
 
-    Γιατί υπάρχει:
-    - Ο orchestrator (backend) χρειάζεται να καλέσει τον agent (hospital node)
-      για validate και train_round.
-    - Χρησιμοποιούμε urllib για minimal deps (χωρίς requests).
-
-    headers: π.χ. {"X-Agent-Secret": AGENT_REG_SECRET}
-    """
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -132,43 +74,23 @@ def _http_json_post(url: str, payload: dict, headers: Optional[dict] = None, tim
 
 @router.get("/health", tags=["core"])
 def health():
-    """
-    Health endpoint του API router (κάτω από /api/v1/health).
-    Διαφέρει από το /health στο main.py (root-level).
-    Και τα δύο είναι “ok” checks.
-    """
     return {"status": "ok"}
 
 
-# -------------------------
+
 # Helpers (scoping)
-# -------------------------
+
 def _dataset_owned_by_org(ds: Dataset, org: str) -> bool:
-    """
-    Έλεγχος ownership:
-    - dataset owner_org ταιριάζει με το org του actor;
-    """
     return (ds.owner_org or "").strip().lower() == (org or "").strip().lower()
 
 
 def _ensure_dataset_visible(actor: Actor, ds: Dataset) -> None:
-    """
-    Access control για “read”:
-    - Hospital βλέπει μόνο datasets του ίδιου org.
-    - Researcher/Biobank μπορούν να βλέπουν (σύμφωνα με PoC σχεδίαση)
-      αλλά sanitization γίνεται αλλού (π.χ. columns=None).
-    """
     if actor.role == ROLE_HOSPITAL:
         if not _dataset_owned_by_org(ds, actor.org):
             raise HTTPException(status_code=403, detail="Dataset not in your organization scope")
 
 
 def _ensure_dataset_writable(actor: Actor, ds: Dataset) -> None:
-    """
-    Access control για “write/modify”:
-    - ΜΟΝΟ Hospital μπορεί να τροποποιεί resource
-    - και μόνο στο δικό του org.
-    """
     if actor.role != ROLE_HOSPITAL:
         raise HTTPException(status_code=403, detail="Only Hospital can modify this resource")
     if not _dataset_owned_by_org(ds, actor.org):
@@ -176,32 +98,20 @@ def _ensure_dataset_writable(actor: Actor, ds: Dataset) -> None:
 
 
 def _same_org(a: str, b: str) -> bool:
-    """Case-insensitive σύγκριση org strings."""
     return (a or "").strip().lower() == (b or "").strip().lower()
 
 
 def _sanitize_dataset_for_actor(actor: Actor, ds: Dataset) -> Dataset:
-    """
-    Data minimization / least privilege:
-    - External parties (Biobank/Researcher) δεν πρέπει να βλέπουν raw columns list.
-      Θα βλέπουν μόνο exposed_features (που έχει εγκρίνει το Hospital).
-    """
-    if actor.role in (ROLE_BIOBANK, ROLE_RESEARCHER):
+    if actor.role in (ROLE_BIOBANK, ROLE_RESEARCHER): # δεν βλέπουν raw columns list-Θα βλέπουν μόνο exposed_features (που έχει εγκρίνει το Hospital).
         ds.columns = None
     return ds
 
 
-# -------------------------
-# Nodes (Agents)
-# -------------------------
+
+# Nodes
+
 @router.post("/nodes/register", response_model=Node, tags=["federation"])
 def register_node(payload: NodeRegister, secret: str = Query(..., description="AGENT_REG_SECRET")):
-    """
-    Endpoint που καλεί ο agent κατά το startup (agent_app.py startup_register()).
-
-    - Δέχεται secret (query param) για να αποτρέψει αυθαίρετο registration.
-    - Καταγράφει node (org, base_url, name) στο store.
-    """
     if secret != AGENT_REG_SECRET:
         raise HTTPException(status_code=403, detail="Invalid registration secret")
     store = get_store()
@@ -210,25 +120,12 @@ def register_node(payload: NodeRegister, secret: str = Query(..., description="A
 
 @router.get("/nodes", response_model=List[Node], tags=["federation"])
 def list_nodes(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-    """
-    Λίστα όλων των registered nodes.
-
-    RBAC:
-    - επιτρέπεται σε Hospital/Biobank/Researcher (PoC design).
-    """
     store = get_store()
     return store.list_nodes()
 
 
 @router.patch("/nodes/{node_id}/heartbeat", response_model=Node, tags=["federation"])
 def heartbeat_node(node_id: UUID, secret: str = Query(...), status: NodeStatus = Query(default=NodeStatus.online)):
-    """
-    Heartbeat endpoint για agent:
-    - ενημερώνει last_seen_at και status.
-
-    Προστασία:
-    - απαιτεί AGENT_REG_SECRET.
-    """
     if secret != AGENT_REG_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
     store = get_store()
@@ -238,47 +135,32 @@ def heartbeat_node(node_id: UUID, secret: str = Query(...), status: NodeStatus =
         raise HTTPException(status_code=404, detail="Node not found")
 
 
-# -------------------------
-# Datasets (Federated-only descriptors)
-# -------------------------
+
+# Datasets (Federated descriptors)
+
 @router.post("/datasets", response_model=Dataset, tags=["core"])
 def create_dataset(payload: DatasetCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
-    """
-    Δημιουργία dataset descriptor (όχι upload αρχείου στο backend).
-
-    Important:
-    - Το actual dataset αρχείο είναι ΣΤΟ agent container (local_uri)
-    - Το backend κρατά descriptor:
-      {schema_id, local_uri, node_id, owner_org, sensitivity_level, ...}
-
-    RBAC:
-    - ΜΟΝΟ Hospital δημιουργεί dataset.
-    - owner_org enforced από token actor.org.
-    """
     store = get_store()
 
     fixed = DatasetCreate(
         name=payload.name,
         description=payload.description,
-        owner_org=actor.org,  # enforce ownership by token org
+        owner_org=actor.org,
         sensitivity_level=payload.sensitivity_level,
         schema_id=payload.schema_id,
         local_uri=payload.local_uri,
         node_id=payload.node_id,
     )
 
-    # dataset πρέπει να “δείχνει” σε υπαρκτό node
-    node = store.get_node(fixed.node_id)
+    node = store.get_node(fixed.node_id)     # το dataset πρέπει να υπάρχει σε υπαρκτό node
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    # dataset node org πρέπει να ταιριάζει με hospital org
     if not _same_org(node.org, actor.org):
-        raise HTTPException(status_code=403, detail="Node org must match your hospital org")
+        raise HTTPException(status_code=403, detail="Node org must match your hospital org")  # το dataset node org πρέπει να ταιριάζει με hospital org
 
     ds = store.create_dataset(fixed, actor=actor.username)
 
-    # blockchain anchoring: καταγράφουμε event για register dataset descriptor
     bc = get_blockchain()
     bc.anchor(
         event_type="DATASET_REGISTERED",
@@ -299,16 +181,6 @@ def create_dataset(payload: DatasetCreate, actor: Actor = Depends(require_roles(
 
 @router.get("/datasets", response_model=List[Dataset], tags=["core"])
 def list_datasets(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-    """
-    Λίστα dataset descriptors.
-
-    Hospital:
-    - βλέπει μόνο datasets του org του.
-
-    Biobank/Researcher:
-    - βλέπει όλα (PoC) αλλά με sanitization: columns=None
-      (άρα δεν διαρρέει πλήρες schema, μόνο exposed_features).
-    """
     store = get_store()
     items = store.list_datasets()
 
@@ -319,15 +191,9 @@ def list_datasets(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBA
 
 
 @router.get("/datasets/{dataset_id}", response_model=Dataset, tags=["core"])
-def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-    """
-    Ανάκτηση ενός dataset descriptor.
-
-    - Ελέγχουμε visibility (hospital only own org)
-    - Για external roles κάνουμε sanitization
-    """
-    store = get_store()
-    ds = store.get_dataset(dataset_id)
+def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))): #visible
+    store = get_store() #προσβαση στο dataset
+    ds = store.get_dataset(dataset_id) # φόρτωση dataset
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     _ensure_dataset_visible(actor, ds)
@@ -336,18 +202,8 @@ def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSP
 
 @router.post("/datasets/{dataset_id}/validate", response_model=Dataset, tags=["federation"])
 def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
-    """
-    Validate dataset descriptor:
-    - Το backend καλεί τον agent (/validate) με local_uri + schema_id.
-    - Ο agent διαβάζει head του αρχείου (csv/xlsx) και επιστρέφει columns + row_count.
-    - Το backend αποθηκεύει validation metadata στο store:
-      status=validated/unavailable, columns, row_count, validation_report.
-
-    RBAC:
-    - ΜΟΝΟ Hospital (και μόνο own org) μπορεί να κάνει validate.
-    """
-    store = get_store()
-    ds = store.get_dataset(dataset_id)
+    store = get_store()  #προσβαση στο dataset
+    ds = store.get_dataset(dataset_id) # Το dataset είναι συνδεδεμένο με node_id
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     _ensure_dataset_writable(actor, ds)
@@ -379,9 +235,7 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
             actor=actor.username,
         )
 
-        # Default rule:
-        # - στο πρώτο validation, αν δεν έχει οριστεί exposed_features,
-        #   το κάνουμε ίδιο με columns (Hospital-approved by default).
+
         if (getattr(updated, "exposed_features", None) is None) and updated.columns:
             updated = store.update_dataset_exposed_features(
                 dataset_id=updated.dataset_id,
@@ -389,7 +243,7 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
                 actor=actor.username,
             )
 
-        # Anchor στο blockchain: validation event
+        #  blockchain -> αποθηκεύει (hash) validation event
         bc = get_blockchain()
         bc.anchor(
             event_type="DATASET_VALIDATED",
@@ -407,7 +261,6 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
         return updated
 
     except Exception as e:
-        # Σε αποτυχία, μαρκάρουμε dataset ως unavailable και κρατάμε error report.
         updated = store.update_dataset_validation(
             dataset_id,
             status=DescriptorStatus.unavailable,
@@ -432,19 +285,11 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
 
 
 @router.patch("/datasets/{dataset_id}/features", response_model=Dataset, tags=["core"])
-def set_dataset_features(
+def set_dataset_features(                  # set features exposed
     dataset_id: UUID,
     payload: DatasetFeaturesUpdate,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
 ):
-    """
-    Hospital sets exposed_features:
-    - Αυτές είναι οι features που μπορούν να “δει” external actor.
-    - Αποτελεί μηχανισμό governance / minimization.
-
-    Validates:
-    - οι requested exposed_features πρέπει να υπάρχουν στα columns (αν columns υπάρχουν).
-    """
     store = get_store()
     ds = store.get_dataset(dataset_id)
     if not ds:
@@ -477,26 +322,16 @@ def set_dataset_features(
     return updated
 
 
-# -------------------------
-# Consent Policies
-# -------------------------
+
+# Consent Policy
+
 @router.post("/consents", response_model=ConsentPolicy, tags=["core"])
 def create_consent(payload: ConsentPolicyCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
-    """
-    Consent Policy (dataset-level policy, όχι per-patient consent).
-
-    - Hospital δημιουργεί policy για dataset.
-    - Store: consents table
-    - Blockchain: anchor CONSENT_POLICY_SET με hash policy_text (όχι raw κείμενο).
-
-    Σκοπός:
-    - governance layer για dataset access/export.
-    """
     store = get_store()
-    ds = store.get_dataset(payload.dataset_id)
+    ds = store.get_dataset(payload.dataset_id) # upload
     if ds is None:
         raise HTTPException(status_code=404, detail="Dataset not found for consent policy")
-    _ensure_dataset_writable(actor, ds)
+    _ensure_dataset_writable(actor, ds) # έλεγχος authrization (org)
 
     cp = store.create_consent_policy(payload, actor=actor.username)
 
@@ -525,21 +360,14 @@ def list_consents(
     dataset_id: Optional[UUID] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-    """
-    Λίστα consent policies.
 
-    - Αν δοθεί dataset_id:
-      ελέγχουμε visibility στο dataset.
-    - Αν actor=Hospital και dataset_id=None:
-      επιστρέφουμε μόνο policies που αφορούν datasets του org του (scoping).
-    """
     store = get_store()
 
     if dataset_id is not None:
         ds = store.get_dataset(dataset_id)
         if ds is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        _ensure_dataset_visible(actor, ds)
+        _ensure_dataset_visible(actor, ds) # visible
 
     policies = store.list_consent_policies(dataset_id=dataset_id)
 
@@ -555,13 +383,7 @@ def get_active_consent(
     dataset_id: UUID,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-    """
-    Επιστρέφει την τελευταία ACTIVE policy για dataset.
 
-    Λογική:
-    - παίρνουμε όλες τις policies (ordered by created_at στο store)
-    - γυρνάμε ανάποδα και βρίσκουμε την πρώτη με status=active
-    """
     store = get_store()
     ds = store.get_dataset(dataset_id)
     if ds is None:
@@ -569,23 +391,19 @@ def get_active_consent(
     _ensure_dataset_visible(actor, ds)
 
     policies = store.list_consent_policies(dataset_id=dataset_id)
-    for p in reversed(policies):
+    for p in reversed(policies):    # Επιστρέφει την τελευταία πιο πρόσφατη policy για dataset.
         if getattr(p, "status", None) == ConsentStatus.active:
             return p
     return None
 
 
 @router.patch("/consents/{policy_id}/status", response_model=ConsentPolicy, tags=["core"])
-def update_consent_status(
+def update_consent_status(  # έλεγχος αν ο Hospital αλλάξει status σε consent policy (draft/active/retired).
     policy_id: UUID,
     status: ConsentStatus = Query(...),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
 ):
-    """
-    Hospital αλλάζει status σε consent policy (draft/active/retired).
-    - Ελέγχουμε ότι το dataset είναι στο org του hospital.
-    - Store update + blockchain anchor CONSENT_STATUS_CHANGED
-    """
+
     store = get_store()
     cp = store.get_consent_policy(policy_id)
     if not cp:
@@ -613,21 +431,15 @@ def update_consent_status(
     return updated
 
 
-# -------------------------
+
 # Access Requests
-# -------------------------
+
 @router.post("/access-requests", response_model=AccessRequest, tags=["core"])
 def create_access_request(
     payload: AccessRequestCreate,
     actor: Actor = Depends(require_roles(ROLE_RESEARCHER, ROLE_BIOBANK)),
 ):
-    """
-    External actor (Researcher/Biobank) δημιουργεί αίτημα πρόσβασης σε dataset.
 
-    Validations:
-    - dataset πρέπει να υπάρχει
-    - requester_org στο payload πρέπει να ταιριάζει με actor.org (ώστε να μην spoofάρει org)
-    """
     store = get_store()
     ds = store.get_dataset(payload.dataset_id)
     if ds is None:
@@ -645,12 +457,7 @@ def list_access_requests(
     status: Optional[RequestStatus] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-    """
-    Λίστα access requests με scoping ανά ρόλο:
-    - Hospital: requests μόνο για datasets του org του
-    - Researcher: μόνο όσα δημιούργησε ο ίδιος (requested_by == username)
-    - Biobank: όσα δημιούργησε ο ίδιος ή ανήκουν στο org του
-    """
+
     store = get_store()
     items = store.list_access_requests(dataset_id=dataset_id, status=status)
 
@@ -675,16 +482,7 @@ def decide_access_request(
     notes: Optional[str] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
 ):
-    """
-    Hospital αποφασίζει access request (approved/denied).
 
-    Ροή:
-    - βρίσκουμε request
-    - βρίσκουμε dataset του request
-    - scoping: dataset πρέπει να είναι στο org του hospital
-    - ενημέρωση store
-    - blockchain anchor ACCESS_REQUEST_DECIDED (notes hashed)
-    """
     store = get_store()
 
     req = None
@@ -719,23 +517,14 @@ def decide_access_request(
     return updated
 
 
-# -------------------------
 # Federated Jobs (PoC)
-# -------------------------
+
 @router.post("/fl/jobs", response_model=FLJob, tags=["federation"])
 def create_fl_job(
     payload: FLJobCreate,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
 ):
-    """
-    Δημιουργία Federated Job (PoC).
 
-    - Δημιουργείται job record στο store
-    - Δεν ξεκινά εκτέλεση εδώ (γίνεται στο /start).
-
-    Scoping:
-    - Hospital μπορεί να δημιουργεί jobs μόνο για datasets του org του.
-    """
     store = get_store()
 
     ds = store.get_dataset(payload.dataset_id)
@@ -749,14 +538,8 @@ def create_fl_job(
 
 
 @router.get("/fl/jobs/{job_id}", response_model=FLJob, tags=["federation"])
-def get_fl_job(
-    job_id: UUID,
-    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
-):
-    """
-    Ανάκτηση job.
-    (PoC: δεν εφαρμόζει scoping εδώ, αλλά μπορεί να προστεθεί αν χρειαστεί.)
-    """
+def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
+
     store = get_store()
     job = store.get_fl_job(job_id)
     if not job:
@@ -766,24 +549,8 @@ def get_fl_job(
 
 @router.post("/fl/jobs/{job_id}/start", response_model=FLJob, tags=["federation"])
 def start_fl_job(
-    job_id: UUID,
-    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
-):
-    """
-    Εκκίνηση Federated Job.
+    job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),):
 
-    Ροή:
-    1) φορτώνουμε job + dataset
-    2) βρίσκουμε node (agent) που “φιλοξενεί” το dataset
-    3) για κάθε round:
-       - backend καλεί agent /train_round
-       - agent υπολογίζει aggregates (mean per feature + metrics)
-       - backend αποθηκεύει trends/metrics στο job record
-    4) στο τέλος: status=finished
-
-    Scoping:
-    - Hospital μπορεί να ξεκινά jobs μόνο σε datasets του org του.
-    """
     store = get_store()
 
     job = store.get_fl_job(job_id)
@@ -834,14 +601,14 @@ def start_fl_job(
             # PoC: “global_model” είναι απλώς το update από τον agent
             # (σε multi-node FL θα γινόταν aggregation)
             if row_count > 0:
-                global_model = update
+                global_model = update # Προς το παρόν τρέχει ένα dataset ανά νοσοκομείο -> δυνατότητα μελλοντικής επέκτασης για πολλά datasets και πολλά νοσοκομεία.
 
             job.current_round = r
             job.global_model = {k: float(v) for k, v in (global_model or {}).items()}
             agent_metrics = resp.get("metrics", {}) or {}
 
-            # round_trends: κρατάμε ιστορικό mean ανά feature σε κάθε round
-            round_trends = (job.metrics or {}).get("round_trends") or {}
+
+            round_trends = (job.metrics or {}).get("round_trends") or {} # κρατάμε ιστορικό mean ανά feature σε κάθε round
             for k, v in (global_model or {}).items():
                 key = f"{k}_mean"
                 round_trends.setdefault(key, [])
@@ -872,16 +639,11 @@ def start_fl_job(
         raise HTTPException(status_code=500, detail=f"FL job failed: {e}")
 
 
-# -------------------------
+
 # Runs / History
-# -------------------------
+
 @router.post("/runs", response_model=Run, tags=["core"])
 def create_run(payload: RunCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-    """
-    Runs/History feature:
-    - UI μπορεί να καταγράφει “τι έτρεξε” ο χρήστης.
-    - Αποθήκευση στο store + blockchain anchor (payload hash).
-    """
     store = get_store()
     entry = store.create_run(actor=actor.username, run_type=payload.run_type, payload=payload.payload)
 
@@ -903,36 +665,26 @@ def create_run(payload: RunCreate, actor: Actor = Depends(require_roles(ROLE_HOS
 
 @router.get("/runs", response_model=List[Run], tags=["core"])
 def list_runs(mine: int = Query(default=0), actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-    """
-    Λίστα runs.
-    - mine=1 -> επιστρέφει μόνο runs του actor (username).
-    - mine=0 -> επιστρέφει όλα (PoC).
-    """
     store = get_store()
     if mine:
         return store.list_runs(actor=actor.username)
     return store.list_runs()
 
 
-# -------------------------
+
 # Audit
-# -------------------------
+
 @router.get("/audit", response_model=List[AuditLog], tags=["core"])
 def list_audit(limit: int = Query(default=100, ge=1, le=500), actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
-    """
-    Audit logs:
-    - Hospital βλέπει audit entries που αφορούν datasets του org του
-      ή entries όπου actor == username.
-    """
     store = get_store()
     logs = store.list_audit(limit=limit)
 
-    org_ds_ids = {str(d.dataset_id) for d in store.list_datasets() if _dataset_owned_by_org(d, actor.org)}
+    org_ds_ids = {str(d.dataset_id) for d in store.list_datasets() if _dataset_owned_by_org(d, actor.org)} # Επιστρέφει μόνο τα δικά του logs (Νοσοκομείου)
     scoped: List[AuditLog] = []
     for e in logs:
         d = e.details or {}
         dsid = str(d.get("dataset_id", "")).strip()
-        if dsid and dsid in org_ds_ids:
+        if dsid and dsid in org_ds_ids: #Κράτα το log αν αφορά dataset του οργανισμού
             scoped.append(e)
             continue
         if (e.actor or "").strip().lower() == actor.username.strip().lower():
@@ -941,55 +693,12 @@ def list_audit(limit: int = Query(default=100, ge=1, le=500), actor: Actor = Dep
     return scoped
 
 
-# -------------------------
+
 # Blockchain receipts
-# -------------------------
+
 @router.get("/blockchain/receipts", response_model=List[dict], tags=["core"])
-def list_blockchain_receipts(
-    limit: int = Query(default=200, ge=1, le=500),
-    actor: Actor = Depends(require_roles("Admin", ROLE_HOSPITAL)),
-):
-    """
-    Επιστρέφει receipts που έχουν αποθηκευτεί στο sqlite (bc_receipts table).
+def list_blockchain_receipts(limit: int = Query(default=200, ge=1, le=500),actor: Actor = Depends(require_roles("Admin", ROLE_HOSPITAL))):
 
-    RBAC:
-    - Admin ή Hospital.
-    (PoC: Hospital δεν έχει scoping ανά org εδώ· μπορεί να προστεθεί.)
-    """
-    store = get_store()
+    store = get_store() # αποδείξεις ότι οι ενέργειες αυτές αγκυρώθηκαν στο blockchain χωρίς να αλλοιωθούν
     return store.list_bc_receipts(limit=limit)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

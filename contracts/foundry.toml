@@ -4,9 +4,3 @@ out = "out"
 libs = ["lib"]
 remappings = ["forge-std/=lib/forge-std/src/"]
 
-
-#Ρυθμίζει πώς χτίζονται και οργανώνονται τα smart contracts
-# αντίστοιχο με pyproject.toml ή docker-compose.yml αλλά για smart contracts).
-# Χωρίς αυτό:
-#δεν θα ήξερε ο compiler πού είναι τι
-#θα “έσπαγαν” τα imports
