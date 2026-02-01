@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, Optional, List
 
 import pandas as pd
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -99,6 +100,13 @@ def api_patch(path: str, params: Optional[dict] = None, payload: Optional[dict] 
         raise RuntimeError(f"PATCH {path} failed: {r.status_code} {r.text}")
     return r.json() if r.text else None
 
+
+def _json_size_kb(obj: Any) -> float:
+    try:
+        b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        return round(len(b) / 1024, 2)
+    except Exception:
+        return 0.0
 
 def log_run(run_type: str, payload: Dict[str, Any]) -> None:  # Καταγράφει “ιστορικό ενεργειών” (Runs / History) στο backend
     try:
@@ -912,18 +920,18 @@ def page_federated_jobs() -> None:
     sections = st.multiselect(
         "Select which analytics sections to display",
         options=[
+            "Performance Summary",
             "Privacy / Governance",
             "Feature Metrics (Distribution & Data Quality)",
             "Normalized Importance",
             "Round Trends",
             "Correlation Matrix",
-            # "Recommended next actions",
         ],
         default=[
+            "Performance Summary",
             "Feature Metrics (Distribution & Data Quality)",
             "Normalized Importance",
             "Round Trends",
-            # "Recommended next actions",
         ],
         key="fl_display_sections",
     )
@@ -936,32 +944,72 @@ def page_federated_jobs() -> None:
 
     if st.button("Start job", type="secondary"):
         try:
-            # Validation: δεν πρέπει να είναι κενό
             if not job_id.strip():
-                st.error("Provide a Job ID.")
+                st.error("Provide a Job ID")
                 st.stop()
 
+            # Timer
+            t0 = time.perf_counter()
             job = api_post(f"/fl/jobs/{job_id.strip()}/start", payload={})
+            t1 = time.perf_counter()
+            ui_duration_sec = round(t1 - t0, 4)
 
             st.success(
                 f"Job finished: status={job.get('status')}, "
                 f"round={job.get('current_round')}"
             )
 
-            #  outputs
-            # Global model / aggregated outputs (για τωρα συνήθως federated statistics)
+            # Extract + enrich metrics
+            metrics = job.get("metrics") or {}
+            metrics["_ui_call_duration_sec"] = ui_duration_sec
+            metrics["_ui_response_size_kb"] = _json_size_kb(job)
+            metrics["_ui_metrics_size_kb"] = _json_size_kb(metrics)
+
+            # Log run
+            log_run(
+                "fl_jobs.start",
+                {
+                    "job_id": job_id.strip(),
+                    "status": job.get("status"),
+                    "current_round": job.get("current_round"),
+                    "dataset_id": job.get("dataset_id"),
+                    "ui_call_duration_sec": ui_duration_sec,
+                    "ui_response_size_kb": metrics["_ui_response_size_kb"],
+                    "metrics": metrics,
+                },
+            )
+
+            # Downloads
+            st.download_button(
+                "Download job result (JSON)",
+                data=json.dumps(job, ensure_ascii=False, indent=2),
+                file_name=f"job_{job_id.strip()}.json",
+                mime="application/json",
+            )
+            st.download_button(
+                "Download metrics (JSON)",
+                data=json.dumps(metrics, ensure_ascii=False, indent=2),
+                file_name=f"metrics_{job_id.strip()}.json",
+                mime="application/json",
+            )
+
+            # Outputs
             st.subheader("Federated Aggregates (Global)")
             st.json(job.get("global_model") or {})
 
-            # Execution metrics
             st.subheader("Execution Metrics")
-            metrics = job.get("metrics") or {}
             st.json(metrics)
 
             if job.get("last_error"):
                 st.error(job.get("last_error"))
 
-            # Enriched analytics
+            # Performance summary
+            if "Performance Summary" in sections:
+                st.subheader("Performance Summary")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("UI call duration (sec)", metrics.get("_ui_call_duration_sec"))
+                col2.metric("Response size (KB)", metrics.get("_ui_response_size_kb"))
+                col3.metric("Metrics size (KB)", metrics.get("_ui_metrics_size_kb"))
 
             # 1) Privacy / Governance
             privacy = metrics.get("privacy") or {}
@@ -969,18 +1017,31 @@ def page_federated_jobs() -> None:
                 st.subheader("Privacy / Governance")
                 st.json(privacy)
 
-            # 2) Feature metrics
+            # 2) Feature metrics (single section: dataframe + download + plot)
             feature_metrics = metrics.get("feature_metrics") or metrics.get("feature_stats") or {}
             if "Feature Metrics (Distribution & Data Quality)" in sections and feature_metrics:
                 st.subheader("Feature Metrics (Distribution & Data Quality)")
                 try:
-
-                    fm_df = (    # Μετατρέπουμε σε DataFrame για καλύτερη ανάγνωση
+                    fm_df = (
                         pd.DataFrame.from_dict(feature_metrics, orient="index")
                         .reset_index()
                         .rename(columns={"index": "feature"})
                     )
                     st.dataframe(fm_df, width="stretch")
+
+                    st.download_button(
+                        "Download feature metrics (CSV)",
+                        data=fm_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"feature_metrics_{job_id.strip()}.csv",
+                        mime="text/csv",
+                    )
+
+                    if "missing_rate" in fm_df.columns:
+                        tmp = fm_df[["feature", "missing_rate"]].copy()
+                        tmp["missing_rate"] = pd.to_numeric(tmp["missing_rate"], errors="coerce").fillna(0.0)
+                        tmp = tmp.sort_values("missing_rate", ascending=False).head(15)
+                        st.bar_chart(tmp.set_index("feature")["missing_rate"])
+
                 except Exception:
                     st.json(feature_metrics)
 
@@ -991,71 +1052,54 @@ def page_federated_jobs() -> None:
                 st.json(norm_imp)
 
             # 4) Round trends
-            # Συνήθως dict: feature_mean -> [values per round]
             round_trends = metrics.get("round_trends")
             if "Round Trends" in sections and round_trends:
-                st.subheader("Round Trends")
-                st.json(round_trends)
+                st.subheader("Round Trends (plots)")
+                if isinstance(round_trends, dict):
+                    for name, series in round_trends.items():
+                        try:
+                            s = pd.Series(series, name=name)
+                            st.line_chart(s)
+                        except Exception:
+                            pass
+                    with st.expander("Raw round_trends JSON"):
+                        st.json(round_trends)
+                else:
+                    st.json(round_trends)
 
-            # 5) Correlation matrix (Pearson)
+            # 5) Correlation matrix
             corr = metrics.get("correlation_matrix")
             if "Correlation Matrix" in sections and corr:
                 st.subheader("Federated Correlation Matrix (Pearson)")
-
-                corr_df = pd.DataFrame(corr).astype(float) # Μετατρέπουμε correlation matrix σε pandas DataFrame
-
-                corr_df = corr_df.reindex(index=corr_df.columns, columns=corr_df.columns)  # Διασφαλίζουμε ότι τα rows/cols έχουν την ίδια σειρά
+                corr_df = pd.DataFrame(corr).astype(float)
+                corr_df = corr_df.reindex(index=corr_df.columns, columns=corr_df.columns)
 
                 n = len(corr_df.columns)
                 fig_w = min(8.0, max(4.5, 0.55 * n))
                 fig_h = min(6.0, max(3.8, 0.55 * n))
                 fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-                vals = corr_df.values.copy()
-                np.fill_diagonal(vals, np.nan)  # αγνοούμε diagonal=1.0 για scaling
-                max_abs = np.nanmax(np.abs(vals))
-                if not np.isfinite(max_abs) or max_abs == 0:
-                    max_abs = 1.0
-
-                v = max(0.10, float(max_abs))
-
-                im = ax.imshow(corr_df.values, vmin=-v, vmax=v, cmap="coolwarm", aspect="equal")
+                im = ax.imshow(corr_df.values, vmin=-1.0, vmax=1.0, cmap="coolwarm", aspect="equal")
 
                 ax.set_xticks(np.arange(n))
                 ax.set_yticks(np.arange(n))
                 ax.set_xticklabels(corr_df.columns, rotation=45, ha="right", fontsize=8)
                 ax.set_yticklabels(corr_df.index, fontsize=8)
-                ax.tick_params(top=False, bottom=True, labeltop=False, labelbottom=True)
 
-                # γράφουμε τις τιμές μέσα στα κελιά
                 vals2 = corr_df.values
                 for i in range(n):
                     for j in range(n):
                         vv = float(vals2[i, j])
-                        # Επιλέγουμε χρώμα γραμματοσειράς για contrast
-                        txt_color = "white" if abs(vv) >= (0.6 * v) else "black"
+                        txt_color = "white" if abs(vv) >= 0.6 else "black"
                         ax.text(j, i, f"{vv:.2f}", ha="center", va="center", fontsize=7, color=txt_color)
 
-                # Colorbar δίπλα στο heatmap
                 cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 cbar.ax.tick_params(labelsize=8)
 
                 ax.set_title("Pearson correlation heatmap", fontsize=10, loc="left", pad=10)
-
                 fig.tight_layout()
-
                 st.pyplot(fig, use_container_width=False)
 
-            """
-             6) Recommended next actions
-            if "Recommended next actions" in sections:
-                #st.subheader("Recommended next actions (rule-based)")
-                #try:
-                    #for a in suggest_actions(metrics):
-                        #st.write(f"- {a}")
-                #except Exception as e:
-                    #st.write(f"- Δεν μπόρεσα να υπολογίσω recommendations. ({e})")
-            """
         except Exception as e:
             st.error(str(e))
 

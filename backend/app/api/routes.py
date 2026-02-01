@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.request
 from typing import List, Optional
 from uuid import UUID
@@ -45,23 +46,17 @@ router.include_router(auth_router, prefix="/auth", tags=["auth"])
 router.include_router(admin_router, prefix="/admin", tags=["admin"])
 router.include_router(patient_consent_router, tags=["patient-consent"])
 
-
 # Debug
-
 @router.get("/debug/version", tags=["core"])
 def debug_version():
-    return {"routes_version": "routes-2026-01-11-fljobs-hospital-enabled"}
-
+    return {"routes_version": "routes-2026-02-01-fljobs-performance-metrics"}
 
 # Config
-
 AGENT_REG_SECRET = os.getenv("AGENT_REG_SECRET", "dev-secret")
-
 AGENT_CALL_TIMEOUT = float(os.getenv("AGENT_CALL_TIMEOUT", "8"))
 
 
 def _http_json_post(url: str, payload: dict, headers: Optional[dict] = None, timeout: float = 8.0) -> dict:
-
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -77,8 +72,7 @@ def health():
     return {"status": "ok"}
 
 
-
-# Helpers (scoping)
+# Helpers
 
 def _dataset_owned_by_org(ds: Dataset, org: str) -> bool:
     return (ds.owner_org or "").strip().lower() == (org or "").strip().lower()
@@ -102,14 +96,21 @@ def _same_org(a: str, b: str) -> bool:
 
 
 def _sanitize_dataset_for_actor(actor: Actor, ds: Dataset) -> Dataset:
-    if actor.role in (ROLE_BIOBANK, ROLE_RESEARCHER): # δεν βλέπουν raw columns list-Θα βλέπουν μόνο exposed_features (που έχει εγκρίνει το Hospital).
+    # Biobank/Researcher: δεν βλέπουν raw columns list -> βλέπουν μόνο exposed_features
+    if actor.role in (ROLE_BIOBANK, ROLE_RESEARCHER):
         ds.columns = None
     return ds
 
 
+def _json_kb(obj: object) -> float:
+    try:
+        b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        return round(len(b) / 1024.0, 2)
+    except Exception:
+        return 0.0
+
 
 # Nodes
-
 @router.post("/nodes/register", response_model=Node, tags=["federation"])
 def register_node(payload: NodeRegister, secret: str = Query(..., description="AGENT_REG_SECRET")):
     if secret != AGENT_REG_SECRET:
@@ -135,7 +136,6 @@ def heartbeat_node(node_id: UUID, secret: str = Query(...), status: NodeStatus =
         raise HTTPException(status_code=404, detail="Node not found")
 
 
-
 # Datasets (Federated descriptors)
 
 @router.post("/datasets", response_model=Dataset, tags=["core"])
@@ -152,12 +152,12 @@ def create_dataset(payload: DatasetCreate, actor: Actor = Depends(require_roles(
         node_id=payload.node_id,
     )
 
-    node = store.get_node(fixed.node_id)     # το dataset πρέπει να υπάρχει σε υπαρκτό node
+    node = store.get_node(fixed.node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
     if not _same_org(node.org, actor.org):
-        raise HTTPException(status_code=403, detail="Node org must match your hospital org")  # το dataset node org πρέπει να ταιριάζει με hospital org
+        raise HTTPException(status_code=403, detail="Node org must match your hospital org")
 
     ds = store.create_dataset(fixed, actor=actor.username)
 
@@ -191,9 +191,9 @@ def list_datasets(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBA
 
 
 @router.get("/datasets/{dataset_id}", response_model=Dataset, tags=["core"])
-def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))): #visible
-    store = get_store() #προσβαση στο dataset
-    ds = store.get_dataset(dataset_id) # φόρτωση dataset
+def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
+    store = get_store()
+    ds = store.get_dataset(dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     _ensure_dataset_visible(actor, ds)
@@ -202,8 +202,8 @@ def get_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSP
 
 @router.post("/datasets/{dataset_id}/validate", response_model=Dataset, tags=["federation"])
 def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
-    store = get_store()  #προσβαση στο dataset
-    ds = store.get_dataset(dataset_id) # Το dataset είναι συνδεδεμένο με node_id
+    store = get_store()
+    ds = store.get_dataset(dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     _ensure_dataset_writable(actor, ds)
@@ -235,7 +235,6 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
             actor=actor.username,
         )
 
-
         if (getattr(updated, "exposed_features", None) is None) and updated.columns:
             updated = store.update_dataset_exposed_features(
                 dataset_id=updated.dataset_id,
@@ -243,7 +242,6 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
                 actor=actor.username,
             )
 
-        #  blockchain -> αποθηκεύει (hash) validation event
         bc = get_blockchain()
         bc.anchor(
             event_type="DATASET_VALIDATED",
@@ -285,7 +283,7 @@ def validate_dataset(dataset_id: UUID, actor: Actor = Depends(require_roles(ROLE
 
 
 @router.patch("/datasets/{dataset_id}/features", response_model=Dataset, tags=["core"])
-def set_dataset_features(                  # set features exposed
+def set_dataset_features(
     dataset_id: UUID,
     payload: DatasetFeaturesUpdate,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
@@ -322,16 +320,14 @@ def set_dataset_features(                  # set features exposed
     return updated
 
 
-
 # Consent Policy
-
 @router.post("/consents", response_model=ConsentPolicy, tags=["core"])
 def create_consent(payload: ConsentPolicyCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
     store = get_store()
-    ds = store.get_dataset(payload.dataset_id) # upload
+    ds = store.get_dataset(payload.dataset_id)
     if ds is None:
         raise HTTPException(status_code=404, detail="Dataset not found for consent policy")
-    _ensure_dataset_writable(actor, ds) # έλεγχος authrization (org)
+    _ensure_dataset_writable(actor, ds)
 
     cp = store.create_consent_policy(payload, actor=actor.username)
 
@@ -360,14 +356,13 @@ def list_consents(
     dataset_id: Optional[UUID] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-
     store = get_store()
 
     if dataset_id is not None:
         ds = store.get_dataset(dataset_id)
         if ds is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        _ensure_dataset_visible(actor, ds) # visible
+        _ensure_dataset_visible(actor, ds)
 
     policies = store.list_consent_policies(dataset_id=dataset_id)
 
@@ -383,7 +378,6 @@ def get_active_consent(
     dataset_id: UUID,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-
     store = get_store()
     ds = store.get_dataset(dataset_id)
     if ds is None:
@@ -391,19 +385,18 @@ def get_active_consent(
     _ensure_dataset_visible(actor, ds)
 
     policies = store.list_consent_policies(dataset_id=dataset_id)
-    for p in reversed(policies):    # Επιστρέφει την τελευταία πιο πρόσφατη policy για dataset.
+    for p in reversed(policies):
         if getattr(p, "status", None) == ConsentStatus.active:
             return p
     return None
 
 
 @router.patch("/consents/{policy_id}/status", response_model=ConsentPolicy, tags=["core"])
-def update_consent_status(  # έλεγχος αν ο Hospital αλλάξει status σε consent policy (draft/active/retired).
+def update_consent_status(
     policy_id: UUID,
     status: ConsentStatus = Query(...),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
 ):
-
     store = get_store()
     cp = store.get_consent_policy(policy_id)
     if not cp:
@@ -431,15 +424,12 @@ def update_consent_status(  # έλεγχος αν ο Hospital αλλάξει sta
     return updated
 
 
-
 # Access Requests
-
 @router.post("/access-requests", response_model=AccessRequest, tags=["core"])
 def create_access_request(
     payload: AccessRequestCreate,
     actor: Actor = Depends(require_roles(ROLE_RESEARCHER, ROLE_BIOBANK)),
 ):
-
     store = get_store()
     ds = store.get_dataset(payload.dataset_id)
     if ds is None:
@@ -457,7 +447,6 @@ def list_access_requests(
     status: Optional[RequestStatus] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
-
     store = get_store()
     items = store.list_access_requests(dataset_id=dataset_id, status=status)
 
@@ -482,7 +471,6 @@ def decide_access_request(
     notes: Optional[str] = Query(default=None),
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
 ):
-
     store = get_store()
 
     req = None
@@ -517,14 +505,13 @@ def decide_access_request(
     return updated
 
 
-# Federated Jobs (PoC)
+# Federated Jobs
 
 @router.post("/fl/jobs", response_model=FLJob, tags=["federation"])
 def create_fl_job(
     payload: FLJobCreate,
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
 ):
-
     store = get_store()
 
     ds = store.get_dataset(payload.dataset_id)
@@ -539,7 +526,6 @@ def create_fl_job(
 
 @router.get("/fl/jobs/{job_id}", response_model=FLJob, tags=["federation"])
 def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
-
     store = get_store()
     job = store.get_fl_job(job_id)
     if not job:
@@ -549,8 +535,9 @@ def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL,
 
 @router.post("/fl/jobs/{job_id}/start", response_model=FLJob, tags=["federation"])
 def start_fl_job(
-    job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),):
-
+    job_id: UUID,
+    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
+):
     store = get_store()
 
     job = store.get_fl_job(job_id)
@@ -574,12 +561,22 @@ def start_fl_job(
     job.last_error = None
     store.update_fl_job(job, actor=actor.username, audit_event=None)
 
+    job_start = time.perf_counter()
+
     try:
         url = f"{node.base_url.rstrip('/')}/train_round"
         global_model: dict = {}
 
+        # init metrics container
+        merged = dict(job.metrics or {})
+        merged.setdefault("participants_count", 1)  # PoC: single agent/node
+        merged.setdefault("round_durations_sec", [])
+        merged.setdefault("round_payload_kb", [])
+        merged.setdefault("blockchain_events", 0)
+
         for r in range(1, job.rounds + 1):
-            # Agent computes round update
+            round_start = time.perf_counter()
+
             resp = _http_json_post(
                 url,
                 payload={
@@ -595,53 +592,127 @@ def start_fl_job(
                 timeout=AGENT_CALL_TIMEOUT,
             )
 
+            round_end = time.perf_counter()
+            round_duration = round(round_end - round_start, 4)
+
             row_count = int(resp.get("row_count", 0) or 0)
             update = resp.get("update", {}) or {}
-
-            # PoC: “global_model” είναι απλώς το update από τον agent
-            # (σε multi-node FL θα γινόταν aggregation)
-            if row_count > 0:
-                global_model = update # Προς το παρόν τρέχει ένα dataset ανά νοσοκομείο -> δυνατότητα μελλοντικής επέκτασης για πολλά datasets και πολλά νοσοκομεία.
-
-            job.current_round = r
-            job.global_model = {k: float(v) for k, v in (global_model or {}).items()}
             agent_metrics = resp.get("metrics", {}) or {}
 
+            # Payload size proxy (KB)
+            payload_kb = _json_kb(update)
 
-            round_trends = (job.metrics or {}).get("round_trends") or {} # κρατάμε ιστορικό mean ανά feature σε κάθε round
+            # PoC “global_model” = update from the agent
+            if row_count > 0:
+                global_model = update
+
+            # Update job state
+            job.current_round = r
+            job.global_model = {k: float(v) for k, v in (global_model or {}).items()}
+
+            # Round trends: keep mean history per feature
+            round_trends = merged.get("round_trends") or {}
             for k, v in (global_model or {}).items():
                 key = f"{k}_mean"
                 round_trends.setdefault(key, [])
                 round_trends[key].append(float(v))
 
-            merged = dict(job.metrics or {})
+            # Merge metrics
             merged.update(agent_metrics)
-            merged.update(
-                {
-                    "last_round_row_count": row_count,
-                    "last_round": r,
-                    "node_id": str(node.node_id),
-                    "round_trends": round_trends,
-                }
-            )
+            merged["last_round_row_count"] = row_count
+            merged["last_round"] = r
+            merged["node_id"] = str(node.node_id)
+            merged["round_trends"] = round_trends
+
+            # Performance metrics
+            merged["round_durations_sec"].append(round_duration)
+            merged["round_payload_kb"].append(payload_kb)
 
             job.metrics = merged
             store.update_fl_job(job, actor=actor.username, audit_event=None)
 
+        job_end = time.perf_counter()
+        total_duration = round(job_end - job_start, 4)
+
+        # add totals
+        merged["job_total_duration_sec"] = total_duration
+        merged["avg_round_duration_sec"] = (
+            round(sum(merged["round_durations_sec"]) / max(1, len(merged["round_durations_sec"])), 4)
+            if merged.get("round_durations_sec")
+            else None
+        )
+        merged["avg_round_payload_kb"] = (
+            round(sum(merged["round_payload_kb"]) / max(1, len(merged["round_payload_kb"])), 2)
+            if merged.get("round_payload_kb")
+            else None
+        )
+
+        # Finalize job
         job.status = FLJobStatus.finished
+        job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
+
+        # Anchor a completion receipt (auditability)
+        bc = get_blockchain()
+        bc.anchor(
+            event_type="FL_JOB_COMPLETED",
+            ref_id=str(job.job_id),
+            payload={
+                "job_id": str(job.job_id),
+                "dataset_id": str(ds.dataset_id),
+                "node_id": str(node.node_id),
+                "rounds": int(job.rounds),
+                "features_count": len(job.features or []),
+                "participants": int(merged.get("participants_count") or 1),
+                "total_duration_sec": total_duration,
+                "avg_round_duration_sec": merged.get("avg_round_duration_sec"),
+                "avg_round_payload_kb": merged.get("avg_round_payload_kb"),
+                "metrics_hash": sha256_hex(merged),
+            },
+            actor=actor,
+        )
+        merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
+        job.metrics = merged
+        store.update_fl_job(job, actor=actor.username, audit_event=None)
+
         return job
 
     except Exception as e:
+        # Mark failed
         job.status = FLJobStatus.failed
         job.last_error = str(e)
+
+        merged = dict(job.metrics or {})
+        merged["job_failed"] = True
+        merged["error_hash"] = sha256_hex({"error": str(e)})
+
+        job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
+
+        # Anchor failure receipt (auditability)
+        try:
+            bc = get_blockchain()
+            bc.anchor(
+                event_type="FL_JOB_FAILED",
+                ref_id=str(job.job_id),
+                payload={
+                    "job_id": str(job.job_id),
+                    "dataset_id": str(ds.dataset_id),
+                    "node_id": str(node.node_id),
+                    "error_hash": merged.get("error_hash"),
+                },
+                actor=actor,
+            )
+            merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
+            job.metrics = merged
+            store.update_fl_job(job, actor=actor.username, audit_event=None)
+        except Exception:
+            pass
+
         raise HTTPException(status_code=500, detail=f"FL job failed: {e}")
 
 
-
 # Runs / History
-
 @router.post("/runs", response_model=Run, tags=["core"])
 def create_run(payload: RunCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
     store = get_store()
@@ -664,27 +735,31 @@ def create_run(payload: RunCreate, actor: Actor = Depends(require_roles(ROLE_HOS
 
 
 @router.get("/runs", response_model=List[Run], tags=["core"])
-def list_runs(mine: int = Query(default=0), actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
+def list_runs(
+    mine: int = Query(default=0),
+    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
+):
     store = get_store()
     if mine:
         return store.list_runs(actor=actor.username)
     return store.list_runs()
 
 
-
 # Audit
-
 @router.get("/audit", response_model=List[AuditLog], tags=["core"])
-def list_audit(limit: int = Query(default=100, ge=1, le=500), actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
+def list_audit(
+    limit: int = Query(default=100, ge=1, le=500),
+    actor: Actor = Depends(require_roles(ROLE_HOSPITAL)),
+):
     store = get_store()
     logs = store.list_audit(limit=limit)
 
-    org_ds_ids = {str(d.dataset_id) for d in store.list_datasets() if _dataset_owned_by_org(d, actor.org)} # Επιστρέφει μόνο τα δικά του logs (Νοσοκομείου)
+    org_ds_ids = {str(d.dataset_id) for d in store.list_datasets() if _dataset_owned_by_org(d, actor.org)}
     scoped: List[AuditLog] = []
     for e in logs:
         d = e.details or {}
         dsid = str(d.get("dataset_id", "")).strip()
-        if dsid and dsid in org_ds_ids: #Κράτα το log αν αφορά dataset του οργανισμού
+        if dsid and dsid in org_ds_ids:
             scoped.append(e)
             continue
         if (e.actor or "").strip().lower() == actor.username.strip().lower():
@@ -693,12 +768,11 @@ def list_audit(limit: int = Query(default=100, ge=1, le=500), actor: Actor = Dep
     return scoped
 
 
-
 # Blockchain receipts
-
 @router.get("/blockchain/receipts", response_model=List[dict], tags=["core"])
-def list_blockchain_receipts(limit: int = Query(default=200, ge=1, le=500),actor: Actor = Depends(require_roles("Admin", ROLE_HOSPITAL))):
-
-    store = get_store() # αποδείξεις ότι οι ενέργειες αυτές αγκυρώθηκαν στο blockchain χωρίς να αλλοιωθούν
+def list_blockchain_receipts(
+    limit: int = Query(default=200, ge=1, le=500),
+    actor: Actor = Depends(require_roles("Admin", ROLE_HOSPITAL)),
+):
+    store = get_store()
     return store.list_bc_receipts(limit=limit)
-

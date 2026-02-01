@@ -35,22 +35,17 @@ services:
       - BC_CHAIN_ID=31337
       - BC_PRIVATE_KEY=${BC_PRIVATE_KEY}
 
-      # Receipt registry (audit anchoring)
       - BC_RECEIPT_CONTRACT_ADDRESS=${BC_RECEIPT_CONTRACT_ADDRESS}
       - BC_RECEIPT_CONTRACT_ABI_PATH=/code/app/abi/ReceiptRegistry.json
 
-      # Consent registry (patient consents)
       - BC_CONSENT_CONTRACT_ADDRESS=${BC_CONSENT_CONTRACT_ADDRESS}
       - BC_CONSENT_CONTRACT_ABI_PATH=/code/app/abi/ConsentRegistry.json
 
-      # Patient portal secret (shared with agents if needed)
       - PATIENT_PORTAL_SECRET=PATIENT_SECRET_123
 
-      # Legacy vars used by current blockchain_service.py (anchors receipts)
       - BC_CONTRACT_ADDRESS=${BC_RECEIPT_CONTRACT_ADDRESS}
       - BC_CONTRACT_ABI_PATH=/code/app/abi/ReceiptRegistry.json
 
-      # Invite codes for registration
       - HOSPITAL_INVITE_CODE=HOSPITAL2026
       - BIOBANK_INVITE_CODE=BIOBANK2026
     depends_on:
