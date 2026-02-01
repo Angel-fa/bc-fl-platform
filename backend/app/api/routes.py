@@ -438,7 +438,32 @@ def create_access_request(
     if payload.requester_org and not _same_org(payload.requester_org, actor.org):
         raise HTTPException(status_code=403, detail="requester_org must match your account org")
 
-    return store.create_access_request(payload, actor=actor.username)
+    created = store.create_access_request(payload, actor=actor.username)
+
+    # On-chain gas/latency/throughput
+    try:
+        bc = get_blockchain()
+        bc.anchor(
+            event_type="ACCESS_REQUEST_SUBMITTED",
+            ref_id=str(created.request_id),
+            payload={
+                "request_id": str(created.request_id),
+                "dataset_id": str(created.dataset_id),
+                "requester_org": str(created.requester_org),
+                "requested_by": str(created.requested_by),
+                "role": str(created.role),
+                "status": str(created.status),
+                "purpose_hash": sha256_hex({"purpose": getattr(created, "purpose", "") or ""}),
+                "notes_hash": sha256_hex({"notes": getattr(created, "notes", "") or ""}),
+                "created_at": str(getattr(created, "created_at", "") or ""),
+            },
+            actor=actor,
+        )
+    except Exception:
+        pass
+
+    return created
+
 
 
 @router.get("/access-requests", response_model=List[AccessRequest], tags=["core"])
@@ -521,8 +546,29 @@ def create_fl_job(
     if actor.role == ROLE_HOSPITAL and not _dataset_owned_by_org(ds, actor.org):
         raise HTTPException(status_code=403, detail="Dataset not in your organization scope")
 
-    return store.create_fl_job(payload, actor=actor.username)
+    job = store.create_fl_job(payload, actor=actor.username)
 
+    # On-chain anchoring for evaluation
+    try:
+        bc = get_blockchain()
+        bc.anchor(
+            event_type="FL_JOB_CREATED",
+            ref_id=str(job.job_id),
+            payload={
+                "job_id": str(job.job_id),
+                "dataset_id": str(job.dataset_id),
+                "rounds": int(job.rounds),
+                "features_count": len(job.features or []),
+                "label_present": bool(job.label),
+                "status": str(job.status),
+                "created_at": str(getattr(job, "created_at", "") or ""),
+            },
+            actor=actor,
+        )
+    except Exception:
+        pass
+
+    return job
 
 @router.get("/fl/jobs/{job_id}", response_model=FLJob, tags=["federation"])
 def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
@@ -653,6 +699,7 @@ def start_fl_job(
         store.update_fl_job(job, actor=actor.username, audit_event=None)
 
         # Anchor a completion receipt (auditability)
+        merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
         bc = get_blockchain()
         bc.anchor(
             event_type="FL_JOB_COMPLETED",
@@ -671,7 +718,7 @@ def start_fl_job(
             },
             actor=actor,
         )
-        merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
+
         job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
 

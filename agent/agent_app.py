@@ -15,7 +15,6 @@ from pydantic import BaseModel, Field
 from openpyxl import load_workbook
 
 
-
 # Env
 
 APP_SECRET = os.getenv("AGENT_REG_SECRET", "dev-secret")
@@ -678,7 +677,6 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             "outlier_z": OUTLIER_Z,
         },
     }
-
 
 @app.post("/patient/consent-link")
 def patient_consent_link(req: PatientConsentLinkRequest, x_agent_secret: Optional[str] = Header(default=None)):

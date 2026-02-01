@@ -93,7 +93,7 @@ def verify_token(token: str) -> Actor:  # Επαληθεύει token και επ
     if not active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User inactive")
 
-    return Actor(username=username, role=role, org=org, is_active=True)
+    return Actor(username=username, role=role, org=org, is_active=active)
 
 
 def get_actor(request: Request) -> Actor:

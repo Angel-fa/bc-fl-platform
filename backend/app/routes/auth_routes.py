@@ -7,9 +7,16 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
-
-from app.auth import Actor, issue_token, require_roles, ROLE_BIOBANK, ROLE_HOSPITAL, ROLE_RESEARCHER
 from app.services.sqlite_store import get_store
+
+from app.auth import (
+    Actor,
+    issue_token,
+    require_roles,
+    ROLE_BIOBANK,
+    ROLE_HOSPITAL,
+    ROLE_RESEARCHER
+)
 
 router = APIRouter()
 

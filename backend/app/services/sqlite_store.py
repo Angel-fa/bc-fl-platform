@@ -391,13 +391,37 @@ class SQLiteStore:
             )
         return entry
 
-    def list_bc_receipts(self, limit: int = 200) -> List[Dict[str, Any]]:
+    #   Επιστρέφει receipts
+    def list_bc_receipts(
+            self,
+            limit: int = 200,
+            event_type: Optional[str] = None,
+            ref_id: Optional[str] = None,) \
+            -> List[Dict[str, Any]]:
+        q = "SELECT payload_json FROM bc_receipts"
+        params: List[Any] = []
+        where: List[str] = []
+
+        if event_type:
+            where.append("event_type = ?")
+            params.append((event_type or "").strip())
+
+        if ref_id:
+            where.append("ref_id = ?")
+            params.append((ref_id or "").strip())
+
+        if where:
+            q += " WHERE " + " AND ".join(where)
+
+        q += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT payload_json FROM bc_receipts ORDER BY created_at DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
-        return [_from_json(r["payload_json"]) for r in rows] #   Επιστρέφει receipts (latest first)
+            rows = c.execute(q, params).fetchall()
+
+        return [_from_json(r["payload_json"]) for r in rows]
+
+
 
     # Nodes
     def register_node(self, payload: NodeRegister, actor: Optional[str] = None) -> Node:   # Καταχωρεί έναν hospital agent node.

@@ -5,11 +5,10 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from web3 import Web3
-
 from app.auth import Actor
 from app.services.sqlite_store import get_store
 
@@ -49,16 +48,25 @@ def _load_contract_abi(path: str) -> list:
 
 
 
-
 @dataclass
 class AnchorReceipt:
     event_type: str
     ref_id: str
     payload_hash: str
+
     tx_hash: Optional[str] = None
     chain_id: Optional[str] = None
     contract_address: Optional[str] = None
     receipt_id: Optional[str] = None
+
+    # Evaluation metrics
+    status: Optional[int] = None
+    block_number: Optional[int] = None
+    gas_used: Optional[int] = None
+    effective_gas_price: Optional[int] = None
+    tx_cost_wei: Optional[int] = None
+    latency_ms: Optional[int] = None
+
 
 
 
@@ -91,10 +99,26 @@ class NoopBlockchainService(BlockchainService):
         payload_hash = sha256_hex(manifest)
 
         store = get_store()
+        t0 = time.perf_counter()
+        # nothing on-chain
+        t1 = time.perf_counter()
+
         store.save_bc_receipt(
             event_type=event_type,
             ref_id=ref_id,
-            payload={"payload_hash": payload_hash, "manifest": manifest, "mode": "noop"},
+            payload={
+                "mode": "noop",
+                "payload_hash": payload_hash,
+                "manifest": manifest,
+
+                # pseudo metrics for uniform analysis
+                "status": 1,
+                "block_number": None,
+                "gas_used": 0,
+                "effective_gas_price": 0,
+                "tx_cost_wei": 0,
+                "latency_ms": int(round((t1 - t0) * 1000.0)),
+            },
             tx_hash=None,
             chain_id=None,
         )
@@ -107,6 +131,12 @@ class NoopBlockchainService(BlockchainService):
             chain_id=None,
             contract_address=None,
             receipt_id=None,
+            status=1,
+            block_number=None,
+            gas_used=0,
+            effective_gas_price=0,
+            tx_cost_wei=0,
+            latency_ms=int(round((t1 - t0) * 1000.0)),
         )
 
     def set_patient_consent(self, dataset_id: str, patient_key_hex: str, allowed: bool, actor: Actor) -> Dict[str, Any]:
@@ -173,7 +203,18 @@ class Web3BlockchainService(BlockchainService):
         self.receipt_contract = self.w3.eth.contract(address=self.receipt_address, abi=receipt_abi)
         self.consent_contract = self.w3.eth.contract(address=self.consent_address, abi=consent_abi)
 
-    def _send_tx(self, fn) -> tuple[str, Any]:
+    def _safe_get(receipt_obj: Any, key: str) -> Any:
+        try:
+            if hasattr(receipt_obj, "get"):
+                return receipt_obj.get(key)
+        except Exception:
+            pass
+        try:
+            return receipt_obj[key]
+        except Exception:
+            return None
+
+    def _send_tx(self, fn) -> tuple[str, Any, Dict[str, Any]]:
         nonce = self.w3.eth.get_transaction_count(self.acct.address)
 
         tx = fn.build_transaction(
@@ -184,7 +225,7 @@ class Web3BlockchainService(BlockchainService):
             }
         )
 
-
+        # Gas limit
         try:
             est = self.w3.eth.estimate_gas(tx)
             tx["gas"] = int(est) + 25_000
@@ -194,18 +235,80 @@ class Web3BlockchainService(BlockchainService):
         try:
             latest = self.w3.eth.get_block("latest")
             base_fee = int(latest.get("baseFeePerGas", 0) or 0)
-            priority = self.w3.to_wei(1, "gwei")
+            priority = int(self.w3.to_wei(1, "gwei"))
             tx["maxPriorityFeePerGas"] = priority
-            tx["maxFeePerGas"] = base_fee + (2 * priority) + self.w3.to_wei(2, "gwei")
+            tx["maxFeePerGas"] = base_fee + (2 * priority) + int(self.w3.to_wei(2, "gwei"))
         except Exception:
-            tx["gasPrice"] = self.w3.eth.gas_price
+            tx["gasPrice"] = int(self.w3.eth.gas_price)
 
         signed = self.w3.eth.account.sign_transaction(tx, private_key=self.private_key)
-        tx_hash_bytes = self.w3.eth.send_raw_transaction(signed.rawTransaction)
-        tx_hash = self.w3.to_hex(tx_hash_bytes)
 
+        t_submit = time.perf_counter()
+        tx_hash_bytes = self.w3.eth.send_raw_transaction(signed.rawTransaction)
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=30)
-        return tx_hash, receipt
+        t_done = time.perf_counter()
+
+        tx_hash = self.w3.to_hex(tx_hash_bytes)
+        latency_ms = int(round((t_done - t_submit) * 1000.0))
+
+        # Receipt metrics
+        gas_used = None
+        effective_gas_price = None
+        tx_cost_wei = None
+        status = None
+        block_number = None
+
+        try:
+            v = _safe_get(receipt, "gasUsed")
+            gas_used = int(v) if v is not None else None
+        except Exception:
+            gas_used = None
+
+        try:
+            v = _safe_get(receipt, "effectiveGasPrice")
+            effective_gas_price = int(v) if v is not None else None
+        except Exception:
+            effective_gas_price = None
+
+        if effective_gas_price is None:
+            # fallback: if tx had gasPrice / maxFeePerGas
+            try:
+                if "gasPrice" in tx:
+                    effective_gas_price = int(tx["gasPrice"])
+                elif "maxFeePerGas" in tx:
+                    # proxy (upper bound)
+                    effective_gas_price = int(tx["maxFeePerGas"])
+            except Exception:
+                effective_gas_price = None
+
+        if gas_used is not None and effective_gas_price is not None:
+            try:
+                tx_cost_wei = int(gas_used) * int(effective_gas_price)
+            except Exception:
+                tx_cost_wei = None
+
+        try:
+            v = _safe_get(receipt, "status")
+            status = int(v) if v is not None else None
+        except Exception:
+            status = None
+
+        try:
+            v = _safe_get(receipt, "blockNumber")
+            block_number = int(v) if v is not None else None
+        except Exception:
+            block_number = None
+
+        metrics = {
+            "latency_ms": latency_ms,
+            "gas_used": gas_used,
+            "effective_gas_price": effective_gas_price,
+            "tx_cost_wei": tx_cost_wei,
+            "status": status,
+            "block_number": block_number,
+        }
+
+        return tx_hash, receipt, metrics
 
     def anchor(self, event_type: str, ref_id: str, payload: Dict[str, Any], actor: Actor) -> AnchorReceipt:
         manifest = {
@@ -228,7 +331,7 @@ class Web3BlockchainService(BlockchainService):
             actor_hash_b32,
         )
 
-        tx_hash, receipt = self._send_tx(fn)
+        tx_hash, receipt, metrics = self._send_tx(fn)
 
         # Προσπάθεια εξαγωγής receiptId από event logs
         receipt_id_hex: Optional[str] = None
@@ -240,13 +343,13 @@ class Web3BlockchainService(BlockchainService):
         except Exception:
             receipt_id_hex = None
 
-
+        # Block timestamp
         try:
-            block = self.w3.eth.get_block(receipt.blockNumber)
-            block_ts = int(block.timestamp)  # Block timestamp
+            bn = int(metrics.get("block_number") or getattr(receipt, "blockNumber", 0) or 0)
+            block = self.w3.eth.get_block(bn) if bn else self.w3.eth.get_block("latest")
+            block_ts = int(block.timestamp)
         except Exception:
             block_ts = int(time.time())
-
 
         store = get_store()
         store.save_bc_receipt(
@@ -257,11 +360,22 @@ class Web3BlockchainService(BlockchainService):
                 "payload_hash": payload_hash_hex,
                 "actor_hash": actor_hash_hex,
                 "manifest": manifest,
+
+                # core receipt references
                 "tx_hash": tx_hash,
                 "contract_address": self.receipt_address,
                 "receipt_id": receipt_id_hex,
-                "block_number": int(receipt.blockNumber),
+
+                # chain/receipt fields
+                "status": metrics.get("status"),
+                "block_number": metrics.get("block_number"),
                 "block_timestamp": block_ts,
+
+                # evaluation metrics
+                "gas_used": metrics.get("gas_used"),
+                "effective_gas_price": metrics.get("effective_gas_price"),
+                "tx_cost_wei": metrics.get("tx_cost_wei"),
+                "latency_ms": metrics.get("latency_ms"),
             },
             tx_hash=tx_hash,
             chain_id=str(self.chain_id),
@@ -275,8 +389,13 @@ class Web3BlockchainService(BlockchainService):
             chain_id=str(self.chain_id),
             contract_address=self.receipt_address,
             receipt_id=receipt_id_hex,
+            status=metrics.get("status"),
+            block_number=metrics.get("block_number"),
+            gas_used=metrics.get("gas_used"),
+            effective_gas_price=metrics.get("effective_gas_price"),
+            tx_cost_wei=metrics.get("tx_cost_wei"),
+            latency_ms=metrics.get("latency_ms"),
         )
-
 
     # Consent (on-chain)
 
@@ -298,7 +417,37 @@ class Web3BlockchainService(BlockchainService):
         patient_key = _hex_to_bytes32(pk)
 
         fn = self.consent_contract.functions.setConsent(dataset_key, patient_key, bool(allowed))
-        tx_hash, receipt = self._send_tx(fn)
+        tx_hash, receipt, metrics = self._send_tx(fn)
+
+        # Dedicated receipt -> PATIENT_CONSENT_TX
+        try:
+            store = get_store()
+            store.save_bc_receipt(
+                event_type="PATIENT_CONSENT_TX",
+                ref_id=f"{ds}:{pk}",
+                payload={
+                    "mode": "contract",
+                    "dataset_id": ds,
+                    "dataset_key": Web3.to_hex(dataset_key),
+                    "patient_key": "0x" + pk,
+                    "allowed": bool(allowed),
+
+                    "contract_address": self.consent_address,
+                    "tx_hash": tx_hash,
+
+                    # evaluation metrics for Smart Contract
+                    "status": metrics.get("status"),
+                    "block_number": metrics.get("block_number"),
+                    "gas_used": metrics.get("gas_used"),
+                    "effective_gas_price": metrics.get("effective_gas_price"),
+                    "tx_cost_wei": metrics.get("tx_cost_wei"),
+                    "latency_ms": metrics.get("latency_ms"),
+                },
+                tx_hash=tx_hash,
+                chain_id=str(self.chain_id),
+            )
+        except Exception:
+            pass
 
         # audit receipt
         self.anchor(
@@ -311,6 +460,8 @@ class Web3BlockchainService(BlockchainService):
                 "allowed": bool(allowed),
                 "consent_contract": self.consent_address,
                 "consent_tx_hash": tx_hash,
+                "gas_used": metrics.get("gas_used"),
+                "tx_latency_ms": metrics.get("latency_ms"),
             },
             actor=actor,
         )

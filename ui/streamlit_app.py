@@ -30,11 +30,12 @@ EXPORT_METHODS = ["federated", "aggregated", "synthetic"]
 
 # Ποιες σελίδες εμφανίζονται σε κάθε ρόλο
 PAGES_BY_ROLE = {
-    "Admin": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
-    "Hospital": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
-    "Biobank": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
-    "Researcher": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Runs / History", "Settings"],
+    "Admin": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
+    "Hospital": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
+    "Biobank": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
+    "Researcher": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
 }
+
 
 
 def role_norm() -> str:
@@ -99,6 +100,30 @@ def api_patch(path: str, params: Optional[dict] = None, payload: Optional[dict] 
     if r.status_code >= 400:
         raise RuntimeError(f"PATCH {path} failed: {r.status_code} {r.text}")
     return r.json() if r.text else None
+
+def _receipt_visible_to_user(r: dict) -> bool:
+    # Admin/Hospital  -> όλα
+    # Biobank/Researcher -> περιορισμένα
+
+    r_role = role_norm()
+    if r_role in ("Admin", "Hospital"):
+        return True
+
+    my_user = (st.session_state.get("username") or "").strip().lower()
+    my_org = (st.session_state.get("org") or "").strip().lower()
+
+    payload = r.get("payload") or {}
+    manifest = payload.get("manifest") or {}
+    actor = manifest.get("actor") or {}
+
+    a_user = (actor.get("username") or "").strip().lower()
+    a_org = (actor.get("org") or "").strip().lower()
+
+    if my_user and a_user == my_user:
+        return True
+    if my_org and a_org == my_org:
+        return True
+    return False
 
 
 def _json_size_kb(obj: Any) -> float:
@@ -1143,6 +1168,100 @@ def page_runs_history() -> None:
                 mime="application/json",
             )
 
+def page_smart_contract() -> None:
+    st.header("Smart Contract")
+    require_login()
+    flash_show()
+
+    # receipts
+    try:
+        receipts = api_get("/blockchain/receipts", params={"limit": 500})
+    except Exception as e:
+        st.error(str(e))
+        st.info("Αν δεν υπάρχει endpoint, έλεγξε ότι το backend έχει GET /blockchain/receipts.")
+        return
+
+    receipts = receipts or []
+
+    # Apply role-based filtering
+    visible = [r for r in receipts if _receipt_visible_to_user(r)]
+
+    if not visible:
+        st.info("No blockchain receipts visible for your role/user yet.")
+        return
+
+    # Build dataframe
+    rows = []
+    for r in visible:
+        payload = r.get("payload") or {}
+        manifest = payload.get("manifest") or {}
+        actor = manifest.get("actor") or {}
+        rows.append(
+            {
+                "created_at": r.get("created_at"),
+                "event_type": r.get("event_type"),
+                "ref_id": r.get("ref_id"),
+                "tx_hash": r.get("tx_hash"),
+                "chain_id": r.get("chain_id"),
+                "block_number": payload.get("block_number"),
+                "block_timestamp": payload.get("block_timestamp"),
+                "actor_username": actor.get("username"),
+                "actor_org": actor.get("org"),
+                "mode": payload.get("mode"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    # Filters
+    st.subheader("Filters")
+    ev_types = sorted([x for x in df["event_type"].dropna().unique().tolist()])
+    pick = st.multiselect("event_type", options=ev_types, default=ev_types)
+
+    fdf = df[df["event_type"].isin(pick)].copy()
+
+    st.subheader("Receipts (filtered)")
+    st.dataframe(fdf, width="stretch")
+
+    st.download_button(
+        "Download receipts (CSV)",
+        data=fdf.to_csv(index=False).encode("utf-8"),
+        file_name="blockchain_receipts_filtered.csv",
+        mime="text/csv",
+    )
+
+    # 5) Simple stats (gas/latency placeholders)
+    st.subheader("Stats")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Receipts count", int(len(fdf)))
+    col2.metric("Unique event_types", int(fdf["event_type"].nunique()))
+    col3.metric("Mode", ", ".join(sorted(set([str(x) for x in fdf["mode"].dropna().unique().tolist()]))) or "-")
+
+    st.subheader("Execution Overview")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total On-chain Events",
+        int(len(fdf))
+    )
+
+    col2.metric(
+        "Distinct Event Types",
+        int(fdf["event_type"].nunique())
+    )
+
+    # Χρονική κάλυψη events (block-based)
+    if "block_timestamp" in fdf.columns and fdf["block_timestamp"].notna().any():
+        t_min = int(fdf["block_timestamp"].min())
+        t_max = int(fdf["block_timestamp"].max())
+        col3.metric(
+            "Blockchain Time Span (sec)",
+            int(t_max - t_min)
+        )
+    else:
+        col3.metric("Blockchain Time Span (sec)", "—")
+
 
 def page_settings() -> None:
     st.header("Settings")
@@ -1196,6 +1315,8 @@ def main() -> None:
         page_federated_jobs()
     elif page == "Runs / History":
         page_runs_history()
+    elif page == "Smart Contract Evaluation":
+        page_smart_contract()
     elif page == "Settings":
         page_settings()
     else:
