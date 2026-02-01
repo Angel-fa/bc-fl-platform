@@ -1315,7 +1315,7 @@ def main() -> None:
         page_federated_jobs()
     elif page == "Runs / History":
         page_runs_history()
-    elif page == "Smart Contract Evaluation":
+    elif page == "Smart Contract":
         page_smart_contract()
     elif page == "Settings":
         page_settings()
