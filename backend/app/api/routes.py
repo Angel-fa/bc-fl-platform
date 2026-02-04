@@ -4,8 +4,9 @@ import json
 import os
 import time
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from uuid import UUID
+import pandas as pd
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -15,7 +16,7 @@ from app.routes.patient_consent_routes import router as patient_consent_router
 from app.services.blockchain_service import get_blockchain, sha256_hex
 from app.services.sqlite_store import get_store
 
-from app.auth import Actor, require_roles, ROLE_BIOBANK, ROLE_HOSPITAL, ROLE_RESEARCHER
+from app.auth import Actor, require_roles, ROLE_BIOBANK, ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_ADMIN
 
 from app.schemas.domain import (
     AccessRequest,
@@ -37,6 +38,7 @@ from app.schemas.domain import (
     RequestStatus,
     Run,
     RunCreate,
+    Role
 )
 
 
@@ -90,7 +92,6 @@ def _ensure_dataset_writable(actor: Actor, ds: Dataset) -> None:
     if not _dataset_owned_by_org(ds, actor.org):
         raise HTTPException(status_code=403, detail="Dataset not in your organization scope")
 
-
 def _same_org(a: str, b: str) -> bool:
     return (a or "").strip().lower() == (b or "").strip().lower()
 
@@ -109,6 +110,183 @@ def _json_kb(obj: object) -> float:
     except Exception:
         return 0.0
 
+def _merge_weighted_means(updates: List[dict], weights: List[int]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    keys = set()
+    for u in (updates or []):
+        keys.update((u or {}).keys())
+
+    for k in keys:
+        num = 0.0
+        den = 0.0
+        for u, w in zip(updates or [], weights or []):
+            if not u or k not in u:
+                continue
+            try:
+                v = float(u[k])
+            except Exception:
+                continue
+
+            ww = float(max(int(w or 0), 0))
+            if ww <= 0:
+                continue
+
+            num += ww * v
+            den += ww
+
+        if den > 0:
+            out[k] = num / den
+
+    return out
+
+import math
+from typing import Tuple
+
+def _merge_feature_sums(suffs: List[dict]) -> Dict[str, dict]:
+    merged: Dict[str, dict] = {}
+
+    for s in (suffs or []):
+        fs = (s or {}).get("feature_sums") or {}
+        for feat, v in fs.items():
+            if not isinstance(v, dict):
+                continue
+            m = merged.setdefault(
+                feat,
+                {"total_rows": 0, "n": 0, "missing": 0, "sum": 0.0, "sumsq": 0.0, "min": None, "max": None},
+            )
+            m["total_rows"] += int(v.get("total_rows") or 0)
+            m["n"] += int(v.get("n") or 0)
+            m["missing"] += int(v.get("missing") or 0)
+            m["sum"] += float(v.get("sum") or 0.0)
+            m["sumsq"] += float(v.get("sumsq") or 0.0)
+
+            vmin = v.get("min")
+            vmax = v.get("max")
+            if vmin is not None:
+                m["min"] = float(vmin) if m["min"] is None else min(float(m["min"]), float(vmin))
+            if vmax is not None:
+                m["max"] = float(vmax) if m["max"] is None else max(float(m["max"]), float(vmax))
+
+    return merged
+
+
+def _feature_metrics_from_merged(merged_fs: Dict[str, dict]) -> Tuple[Dict[str, dict], Dict[str, float]]:
+    feature_metrics: Dict[str, dict] = {}
+    variances: Dict[str, float] = {}
+
+    for feat, v in (merged_fs or {}).items():
+        n = int(v.get("n") or 0)
+        total = int(v.get("total_rows") or 0)
+        miss = int(v.get("missing") or max(total - n, 0))
+        ssum = float(v.get("sum") or 0.0)
+        ssq = float(v.get("sumsq") or 0.0)
+
+        if n > 0:
+            mean = ssum / n
+            var = max((ssq / n) - (mean * mean), 0.0)  # population variance
+            std = math.sqrt(var)
+        else:
+            mean = 0.0
+            var = 0.0
+            std = 0.0
+
+        missing_rate = float(miss / max(total, 1))
+
+        feature_metrics[feat] = {
+            "mean": float(mean),
+            "std": float(std),
+            "min": float(v["min"]) if v.get("min") is not None else 0.0,
+            "max": float(v["max"]) if v.get("max") is not None else 0.0,
+            "missing_rate": float(missing_rate),
+            "variance": float(var),
+
+            # αυτά ΔΕΝ μπορούν να συγχωνευτούν ακριβώς χωρίς sketch/hist
+            "median": None,
+            "q1": None,
+            "q3": None,
+            "iqr": None,
+            "outlier_rate": None,
+            "unique_values": None,
+            "is_constant": None,
+        }
+        variances[feat] = float(var)
+
+    total_var = float(sum(max(x, 0.0) for x in variances.values()))
+    normalized_importance = {
+        k: (max(v, 0.0) / total_var if total_var > 0 else 0.0)
+        for k, v in variances.items()
+    }
+
+    return feature_metrics, normalized_importance
+
+
+def _merge_pair_sums(suffs: List[dict]) -> Dict[str, dict]:
+    merged: Dict[str, dict] = {}
+    for s in (suffs or []):
+        ps = (s or {}).get("pair_sums") or {}
+        for key, v in ps.items():
+            if not isinstance(v, dict):
+                continue
+            m = merged.setdefault(
+                key,
+                {"n": 0, "sum_x": 0.0, "sum_y": 0.0, "sum_x2": 0.0, "sum_y2": 0.0, "sum_xy": 0.0},
+            )
+            m["n"] += int(v.get("n") or 0)
+            m["sum_x"] += float(v.get("sum_x") or 0.0)
+            m["sum_y"] += float(v.get("sum_y") or 0.0)
+            m["sum_x2"] += float(v.get("sum_x2") or 0.0)
+            m["sum_y2"] += float(v.get("sum_y2") or 0.0)
+            m["sum_xy"] += float(v.get("sum_xy") or 0.0)
+    return merged
+
+
+def _corr_from_pair_sums(merged_pairs: Dict[str, dict], features: List[str]) -> Dict[str, Dict[str, float]]:
+    feats = [f for f in (features or []) if f]
+    corr: Dict[str, Dict[str, float]] = {f: {g: 0.0 for g in feats} for f in feats}
+
+    for i in range(len(feats)):
+        for j in range(i, len(feats)):
+            a = feats[i]
+            b = feats[j]
+
+            key1 = f"{a}||{b}"
+            key2 = f"{b}||{a}"
+            v = merged_pairs.get(key1) or merged_pairs.get(key2) or {}
+
+            n = int(v.get("n") or 0)
+            if n <= 1:
+                val = 0.0
+            else:
+                sum_x = float(v.get("sum_x") or 0.0)
+                sum_y = float(v.get("sum_y") or 0.0)
+                sum_x2 = float(v.get("sum_x2") or 0.0)
+                sum_y2 = float(v.get("sum_y2") or 0.0)
+                sum_xy = float(v.get("sum_xy") or 0.0)
+
+                ex = sum_x / n
+                ey = sum_y / n
+                ex2 = sum_x2 / n
+                ey2 = sum_y2 / n
+                exy = sum_xy / n
+
+                varx = max(ex2 - ex * ex, 0.0)
+                vary = max(ey2 - ey * ey, 0.0)
+                denom = math.sqrt(varx) * math.sqrt(vary)
+
+                if denom == 0.0:
+                    val = 0.0
+                else:
+                    cov = exy - ex * ey
+                    val = max(min(cov / denom, 1.0), -1.0)
+
+            corr[a][b] = float(val)
+            corr[b][a] = float(val)
+
+    for f in feats:
+        corr[f][f] = 1.0
+
+    return corr
+
 
 # Nodes
 @router.post("/nodes/register", response_model=Node, tags=["federation"])
@@ -120,7 +298,7 @@ def register_node(payload: NodeRegister, secret: str = Query(..., description="A
 
 
 @router.get("/nodes", response_model=List[Node], tags=["federation"])
-def list_nodes(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
+def list_nodes(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN))):
     store = get_store()
     return store.list_nodes()
 
@@ -324,6 +502,7 @@ def set_dataset_features(
 @router.post("/consents", response_model=ConsentPolicy, tags=["core"])
 def create_consent(payload: ConsentPolicyCreate, actor: Actor = Depends(require_roles(ROLE_HOSPITAL))):
     store = get_store()
+
     ds = store.get_dataset(payload.dataset_id)
     if ds is None:
         raise HTTPException(status_code=404, detail="Dataset not found for consent policy")
@@ -529,9 +708,7 @@ def decide_access_request(
     )
     return updated
 
-
 # Federated Jobs
-
 @router.post("/fl/jobs", response_model=FLJob, tags=["federation"])
 def create_fl_job(
     payload: FLJobCreate,
@@ -539,16 +716,50 @@ def create_fl_job(
 ):
     store = get_store()
 
-    ds = store.get_dataset(payload.dataset_id)
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    scope = (payload.scope or "single_node").strip()
+    if scope not in ("single_node", "multi_node"):
+        raise HTTPException(status_code=400, detail="Invalid scope")
 
-    if actor.role == ROLE_HOSPITAL and not _dataset_owned_by_org(ds, actor.org):
-        raise HTTPException(status_code=403, detail="Dataset not in your organization scope")
+    if scope == "single_node":
+        # keep only primary
+        payload.scope = "single_node"
+        payload.dataset_ids = [payload.dataset_id]
+    else:
+        payload.scope = "multi_node"
+        # include primary + unique others
+        ds_ids = list(dict.fromkeys([payload.dataset_id] + list(payload.dataset_ids or [])))
+        if len(ds_ids) < 2:
+            raise HTTPException(status_code=400, detail="multi_node requires at least 2 datasets")
+        payload.dataset_ids = ds_ids
+
+    # Validate access for ALL datasets involved
+    check_ids = list(payload.dataset_ids or [])
+    resolved = []
+    for did in check_ids:
+        ds = store.get_dataset(did)
+        if not ds:
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {did}")
+
+        if actor.role == ROLE_HOSPITAL and not _dataset_owned_by_org(ds, actor.org):
+            raise HTTPException(status_code=403, detail=f"Dataset not in your organization scope: {did}")
+
+        resolved.append(ds)
+
+    payload.created_by = actor.username
+    payload.created_by_org = actor.org
+
+    role_map = {
+        ROLE_HOSPITAL: Role.Hospital,
+        ROLE_BIOBANK: Role.Biobank,
+        ROLE_RESEARCHER: Role.Researcher,
+        ROLE_ADMIN: Role.Admin,
+    }
+    payload.created_by_role = role_map.get(actor.role)
+    if payload.created_by_role is None:
+        raise HTTPException(status_code=400, detail=f"Invalid actor.role: {actor.role}")
 
     job = store.create_fl_job(payload, actor=actor.username)
 
-    # On-chain anchoring for evaluation
     try:
         bc = get_blockchain()
         bc.anchor(
@@ -556,7 +767,10 @@ def create_fl_job(
             ref_id=str(job.job_id),
             payload={
                 "job_id": str(job.job_id),
-                "dataset_id": str(job.dataset_id),
+                "scope": job.scope,
+                "dataset_id_primary": str(job.dataset_id),
+                "dataset_ids": [str(x) for x in (job.dataset_ids or [])],
+                "datasets_count": len(job.dataset_ids or []),
                 "rounds": int(job.rounds),
                 "features_count": len(job.features or []),
                 "label_present": bool(job.label),
@@ -570,14 +784,40 @@ def create_fl_job(
 
     return job
 
+
+@router.get("/fl/jobs", response_model=List[FLJob], tags=["federation"])
+def list_fl_jobs(
+    limit: int = 200,
+    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN)),
+):
+    store = get_store()
+    jobs = store.list_fl_jobs(limit=int(limit))
+
+    # Admin: όλα
+    if actor.role == ROLE_ADMIN:
+        return jobs
+
+    # Hospital: μόνο jobs που έχουν primary dataset owned_by_org = actor.org
+    if actor.role == ROLE_HOSPITAL:
+        out = []
+        for j in jobs:
+            ds = store.get_dataset(j.dataset_id)
+            if ds and _dataset_owned_by_org(ds, actor.org):
+                out.append(j)
+        return out
+
+    # Biobank / Researcher: μόνο jobs που δημιούργησε ο ίδιος
+    my_user = (actor.username or "").strip().lower()
+    return [j for j in jobs if (j.created_by or "").strip().lower() == my_user]
+
 @router.get("/fl/jobs/{job_id}", response_model=FLJob, tags=["federation"])
-def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER))):
+def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN))):
     store = get_store()
     job = store.get_fl_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # (προαιρετικά) access filtering όπως στο list_fl_jobs
     return job
-
 
 @router.post("/fl/jobs/{job_id}/start", response_model=FLJob, tags=["federation"])
 def start_fl_job(
@@ -590,18 +830,34 @@ def start_fl_job(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    ds = store.get_dataset(job.dataset_id)
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found for job")
+    scope = (getattr(job, "scope", None) or "single_node").strip()
+    if scope not in ("single_node", "multi_node"):
+        scope = "single_node"
 
-    if actor.role == ROLE_HOSPITAL and not _dataset_owned_by_org(ds, actor.org):
-        raise HTTPException(status_code=403, detail="Dataset not in your organization scope")
+    if scope == "single_node":
+        ds_ids = [job.dataset_id]
+    else:
+        ds_ids = list(getattr(job, "dataset_ids", None) or [])
+        if not ds_ids:
+            ds_ids = [job.dataset_id]
+        if str(job.dataset_id) not in {str(x) for x in ds_ids}:
+            ds_ids = [job.dataset_id] + ds_ids
 
-    node = store.get_node(ds.node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found for dataset")
+    targets = []
+    for did in ds_ids:
+        ds = store.get_dataset(did)
+        if not ds:
+            raise HTTPException(status_code=404, detail=f"Dataset not found for job: {did}")
 
-    # Mark running
+        if actor.role == ROLE_HOSPITAL and not _dataset_owned_by_org(ds, actor.org):
+            raise HTTPException(status_code=403, detail=f"Dataset not in your organization scope: {did}")
+
+        node = store.get_node(ds.node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"Node not found for dataset: {did}")
+
+        targets.append({"ds": ds, "node": node})
+
     job.status = FLJobStatus.running
     job.current_round = 0
     job.last_error = None
@@ -610,77 +866,199 @@ def start_fl_job(
     job_start = time.perf_counter()
 
     try:
-        url = f"{node.base_url.rstrip('/')}/train_round"
         global_model: dict = {}
 
-        # init metrics container
+        # RESET per-run/per-round
         merged = dict(job.metrics or {})
-        merged.setdefault("participants_count", 1)  # PoC: single agent/node
-        merged.setdefault("round_durations_sec", [])
-        merged.setdefault("round_payload_kb", [])
-        merged.setdefault("blockchain_events", 0)
 
-        for r in range(1, job.rounds + 1):
+        merged["round_durations_sec"] = []
+        merged["round_payload_kb"] = []
+        merged["round_trends"] = {}
+        merged["per_node_row_counts"] = []
+
+        merged["feature_metrics"] = {}
+        merged["normalized_importance"] = {}
+        merged["correlation_matrix"] = {}
+        merged["privacy"] = {}
+        merged.pop("debug_sufficient_stats", None)
+
+        merged["blockchain_events"] = int(merged.get("blockchain_events") or 0)
+        merged["scope"] = scope
+        merged["dataset_ids"] = [str(x) for x in ds_ids]
+
+        merged["last_round_row_count"] = None
+        merged["last_round"] = 0
+        merged["job_total_duration_sec"] = None
+        merged["avg_round_duration_sec"] = None
+        merged["avg_round_payload_kb"] = None
+
+        job.metrics = merged
+        store.update_fl_job(job, actor=actor.username, audit_event=None)
+
+        last_feature_metrics = {}
+        last_norm_imp = {}
+        last_corr = {}
+        last_privacy = {}
+
+        for r in range(1, int(job.rounds) + 1):
             round_start = time.perf_counter()
 
-            resp = _http_json_post(
-                url,
-                payload={
-                    "job_id": str(job.job_id),
-                    "round": r,
-                    "dataset_id": str(ds.dataset_id),
-                    "local_uri": ds.local_uri,
-                    "schema_id": ds.schema_id,
-                    "features": job.features,
-                    "label": job.label,
-                },
-                headers={"X-Agent-Secret": AGENT_REG_SECRET},
-                timeout=AGENT_CALL_TIMEOUT,
-            )
+            round_updates = []
+            round_weights = []
+            round_nodes = []
+
+            # NEW: collect sufficient stats from all nodes
+            round_suffs: List[dict] = []
+            present_features_union: List[str] = []
+            min_row_thresholds: List[int] = []
+            any_suppressed = False
+
+            for t in targets:
+                ds = t["ds"]
+                node = t["node"]
+                url = f"{node.base_url.rstrip('/')}/train_round"
+
+                resp = _http_json_post(
+                    url,
+                    payload={
+                        "job_id": str(job.job_id),
+                        "round": r,
+                        "dataset_id": str(ds.dataset_id),
+                        "local_uri": ds.local_uri,
+                        "schema_id": ds.schema_id,
+                        "features": job.features,
+                        "label": job.label,
+                    },
+                    headers={"X-Agent-Secret": AGENT_REG_SECRET},
+                    timeout=AGENT_CALL_TIMEOUT,
+                )
+
+                node_metrics = resp.get("metrics") or {}
+                privacy = {}
+                if isinstance(node_metrics, dict):
+                    privacy = node_metrics.get("privacy") or {}
+                if not isinstance(privacy, dict):
+                    privacy = {}
+
+                is_suppressed = bool(privacy.get("suppressed") is True)
+
+                effective = None
+                if isinstance(node_metrics, dict):
+                    erc = node_metrics.get("effective_row_count")
+                    if erc is not None:
+                        try:
+                            effective = int(erc)
+                        except Exception:
+                            effective = None
+
+                row_count_raw = int(resp.get("row_count", 0) or 0)
+                row_count = int(effective if (effective is not None) else row_count_raw)
+
+                if is_suppressed:
+                    row_count = 0
+                    update = {}
+                else:
+                    update = resp.get("update", {}) or {}
+
+                round_updates.append(update)
+                round_weights.append(row_count)
+                round_nodes.append(str(node.node_id))
+
+                thr = privacy.get("min_row_threshold")
+                if thr is not None:
+                    try:
+                        min_row_thresholds.append(int(thr))
+                    except Exception:
+                        pass
+                if is_suppressed:
+                    any_suppressed = True
+
+                # sufficient stats (only if not suppressed)
+                if (not is_suppressed) and isinstance(node_metrics, dict):
+                    suff = node_metrics.get("sufficient_stats") or {}
+                    if isinstance(suff, dict) and suff:
+                        round_suffs.append(suff)
+                        pf = suff.get("present_features") or []
+                        if isinstance(pf, list):
+                            for x in pf:
+                                if x and x not in present_features_union:
+                                    present_features_union.append(str(x))
+
+            total_rows = int(sum(round_weights))
+
+            if total_rows <= 0:
+                global_model = {}
+            else:
+                global_model = _merge_weighted_means(round_updates, round_weights)
 
             round_end = time.perf_counter()
             round_duration = round(round_end - round_start, 4)
 
-            row_count = int(resp.get("row_count", 0) or 0)
-            update = resp.get("update", {}) or {}
-            agent_metrics = resp.get("metrics", {}) or {}
+            # metrics basic
+            merged["last_round_row_count"] = total_rows
+            merged["last_round"] = r
 
-            # Payload size proxy (KB)
-            payload_kb = _json_kb(update)
+            merged["node_ids"] = round_nodes
+            merged["participants_count"] = len(round_nodes)
 
-            # PoC “global_model” = update from the agent
-            if row_count > 0:
-                global_model = update
+            payload_kb = float(sum(_json_kb(u or {}) for u in round_updates))
+            merged["round_payload_kb"].append(round(payload_kb, 4))
+            merged["round_durations_sec"].append(round_duration)
 
-            # Update job state
-            job.current_round = r
-            job.global_model = {k: float(v) for k, v in (global_model or {}).items()}
+            merged["per_node_row_counts"].append(
+                {round_nodes[i]: int(round_weights[i]) for i in range(len(round_nodes))}
+            )
 
-            # Round trends: keep mean history per feature
+            # round trends on GLOBAL aggregates
             round_trends = merged.get("round_trends") or {}
             for k, v in (global_model or {}).items():
                 key = f"{k}_mean"
                 round_trends.setdefault(key, [])
                 round_trends[key].append(float(v))
-
-            # Merge metrics
-            merged.update(agent_metrics)
-            merged["last_round_row_count"] = row_count
-            merged["last_round"] = r
-            merged["node_id"] = str(node.node_id)
             merged["round_trends"] = round_trends
 
-            # Performance metrics
-            merged["round_durations_sec"].append(round_duration)
-            merged["round_payload_kb"].append(payload_kb)
+            if round_suffs:
+                merged_fs = _merge_feature_sums(round_suffs)
+                fm, ni = _feature_metrics_from_merged(merged_fs)
 
+                merged_pairs = _merge_pair_sums(round_suffs)
+                corr = _corr_from_pair_sums(merged_pairs, features=(present_features_union or (job.features or [])))
+
+                thr = max(min_row_thresholds) if min_row_thresholds else None
+                priv = {
+                    "min_row_threshold": thr,
+                    "suppressed": bool(any_suppressed or (thr is not None and total_rows < int(thr))),
+                }
+
+                merged["feature_metrics"] = fm
+                merged["normalized_importance"] = ni
+                merged["correlation_matrix"] = corr
+                merged["privacy"] = priv
+
+                last_feature_metrics = fm
+                last_norm_imp = ni
+                last_corr = corr
+                last_privacy = priv
+
+                merged["debug_sufficient_stats"] = {
+                    "enabled": True,
+                    "nodes_with_stats": len(round_suffs),
+                    "present_features_count": len(present_features_union),
+                }
+            else:
+                merged["debug_sufficient_stats"] = {
+                    "enabled": False,
+                    "reason": "agents did not return metrics.sufficient_stats",
+                }
+
+            job.current_round = r
+            job.global_model = {k: float(v) for k, v in (global_model or {}).items()}
             job.metrics = merged
             store.update_fl_job(job, actor=actor.username, audit_event=None)
 
         job_end = time.perf_counter()
         total_duration = round(job_end - job_start, 4)
 
-        # add totals
         merged["job_total_duration_sec"] = total_duration
         merged["avg_round_duration_sec"] = (
             round(sum(merged["round_durations_sec"]) / max(1, len(merged["round_durations_sec"])), 4)
@@ -693,50 +1071,70 @@ def start_fl_job(
             else None
         )
 
-        # Finalize job
+        if last_feature_metrics:
+            merged["feature_metrics"] = last_feature_metrics
+        if last_norm_imp:
+            merged["normalized_importance"] = last_norm_imp
+        if last_corr:
+            merged["correlation_matrix"] = last_corr
+        if last_privacy:
+            merged["privacy"] = last_privacy
+
         job.status = FLJobStatus.finished
         job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
 
-        # Anchor a completion receipt (auditability)
-        merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
-        bc = get_blockchain()
-        bc.anchor(
-            event_type="FL_JOB_COMPLETED",
-            ref_id=str(job.job_id),
-            payload={
-                "job_id": str(job.job_id),
-                "dataset_id": str(ds.dataset_id),
-                "node_id": str(node.node_id),
-                "rounds": int(job.rounds),
-                "features_count": len(job.features or []),
-                "participants": int(merged.get("participants_count") or 1),
-                "total_duration_sec": total_duration,
-                "avg_round_duration_sec": merged.get("avg_round_duration_sec"),
-                "avg_round_payload_kb": merged.get("avg_round_payload_kb"),
-                "metrics_hash": sha256_hex(merged),
-            },
-            actor=actor,
-        )
+        # blockchain receipt
+        try:
+            merged["blockchain_events"] = int(merged.get("blockchain_events") or 0) + 1
+            bc = get_blockchain()
+
+            node_ids = list(merged.get("node_ids") or [])
+            participants = int(merged.get("participants_count") or len(node_ids) or 1)
+
+            bc.anchor(
+                event_type="FL_JOB_COMPLETED",
+                ref_id=str(job.job_id),
+                payload={
+                    "job_id": str(job.job_id),
+                    "scope": scope,
+                    "dataset_id_primary": str(job.dataset_id),
+                    "dataset_ids": [str(x) for x in ds_ids],
+                    "node_ids": node_ids,
+                    "datasets_count": len(ds_ids),
+                    "participants": participants,
+                    "rounds": int(job.rounds),
+                    "features_count": len(job.features or []),
+                    "total_duration_sec": total_duration,
+                    "avg_round_duration_sec": merged.get("avg_round_duration_sec"),
+                    "avg_round_payload_kb": merged.get("avg_round_payload_kb"),
+                    "total_rows_last_round": int(merged.get("last_round_row_count") or 0),
+                    "per_node_row_counts_hash": sha256_hex(merged.get("per_node_row_counts") or []),
+                    "metrics_hash": sha256_hex(merged),
+                },
+                actor=actor,
+            )
+        except Exception:
+            pass
 
         job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
-
         return job
 
     except Exception as e:
-        # Mark failed
         job.status = FLJobStatus.failed
         job.last_error = str(e)
 
         merged = dict(job.metrics or {})
         merged["job_failed"] = True
         merged["error_hash"] = sha256_hex({"error": str(e)})
+        merged["scope"] = scope
+        merged["dataset_ids"] = [str(x) for x in ds_ids]
+        merged.setdefault("node_ids", [str(t["node"].node_id) for t in targets] if targets else [])
 
         job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
 
-        # Anchor failure receipt (auditability)
         try:
             bc = get_blockchain()
             bc.anchor(
@@ -744,8 +1142,10 @@ def start_fl_job(
                 ref_id=str(job.job_id),
                 payload={
                     "job_id": str(job.job_id),
-                    "dataset_id": str(ds.dataset_id),
-                    "node_id": str(node.node_id),
+                    "scope": scope,
+                    "dataset_id_primary": str(job.dataset_id),
+                    "dataset_ids": [str(x) for x in ds_ids],
+                    "node_ids": merged.get("node_ids") or [],
                     "error_hash": merged.get("error_hash"),
                 },
                 actor=actor,
@@ -757,7 +1157,6 @@ def start_fl_job(
             pass
 
         raise HTTPException(status_code=500, detail=f"FL job failed: {e}")
-
 
 # Runs / History
 @router.post("/runs", response_model=Run, tags=["core"])
@@ -787,10 +1186,14 @@ def list_runs(
     actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER)),
 ):
     store = get_store()
-    if mine:
-        return store.list_runs(actor=actor.username)
-    return store.list_runs()
 
+    if actor.role != ROLE_ADMIN:
+        return store.list_runs_for_user(actor.username)
+
+    if mine:
+        return store.list_runs_for_user(actor.username)
+
+    return store.list_runs_all()
 
 # Audit
 @router.get("/audit", response_model=List[AuditLog], tags=["core"])
@@ -819,7 +1222,7 @@ def list_audit(
 @router.get("/blockchain/receipts", response_model=List[dict], tags=["core"])
 def list_blockchain_receipts(
     limit: int = Query(default=200, ge=1, le=500),
-    actor: Actor = Depends(require_roles("Admin", ROLE_HOSPITAL)),
+    actor: Actor = Depends(require_roles("Admin", "Hospital", "Biobank", "Researcher")),
 ):
     store = get_store()
     return store.list_bc_receipts(limit=limit)

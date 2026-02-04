@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth import Actor
-from app.services.blockchain_service import get_blockchain, sha256_hex_str
+from app.services.blockchain_service import get_blockchain, sha256_hex_str, sha256_hex
 
 
 router = APIRouter(prefix="", tags=["patient-consent"])
@@ -39,7 +39,6 @@ def _portal_secret_ok(secret: Optional[str]) -> bool:   #   Ελέγχει αν 
 
 
 # Public endpoint: set consent
-
 @router.post("/public/consent")
 def public_set_consent(req: PublicConsentRequest) -> Dict[str, Any]:
 
@@ -64,8 +63,35 @@ def public_set_consent(req: PublicConsentRequest) -> Dict[str, Any]:
         allowed=allowed,
         actor=actor,
     )
-    return out
 
+    event_type = "PATIENT_CONSENT_TX"
+    ref_id = f"{req.dataset_id}:{patient_key_hex}"
+
+    #  payload_hash (σταθερό, χωρίς raw patient_id)
+    payload_hash = sha256_hex({
+        "event_type": event_type,
+        "ref_id": ref_id,
+        "dataset_id": req.dataset_id,
+        "patient_key": patient_key_hex,
+        "allowed": bool(allowed),
+    })
+
+    tx_hash = out.get("tx_hash")
+    chain_id = out.get("chain_id")
+    contract_address = (
+        out.get("contract_address")
+        or out.get("consent_contract_address")
+        or out.get("consent_contract")
+    )
+
+    return {
+        "event_type": event_type,
+        "ref_id": ref_id,
+        "tx_hash": tx_hash,
+        "chain_id": chain_id,
+        "contract_address": contract_address,
+        "payload_hash": payload_hash,
+    }
 
 #  check consent
 

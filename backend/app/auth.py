@@ -108,6 +108,10 @@ def require_roles(*roles: str):
     allowed: Sequence[str] = roles
 
     def _dep(actor: Actor = Depends(get_actor)) -> Actor:
+        # Admin = superuser
+        if actor.role == ROLE_ADMIN:
+            return actor
+
         if actor.role not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

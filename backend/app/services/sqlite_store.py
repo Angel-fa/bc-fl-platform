@@ -1,4 +1,3 @@
-# Aποθήκευση δεδομένων της πλατφόρμας ακόμη και αν γίνει restart το backend container
 
 from __future__ import annotations
 
@@ -230,8 +229,6 @@ class SQLiteStore:
             if existing:
                 raise ValueError("Username already exists")
 
-            # is_active αποθηκεύεται και ως στήλη για ευκολία filtering,
-            # αλλά και μέσα στο payload_json
             c.execute(
                 "INSERT INTO users(username, created_at, is_active, payload_json) VALUES (?, ?, ?, ?)",
                 (username, created_at.isoformat(), 1, _to_json(user_obj)),
@@ -250,7 +247,6 @@ class SQLiteStore:
 
         data = _from_json(row["payload_json"]) or {}
 
-        # created_at: στο payload_json μπορεί να είναι string -> το γυρνάμε σε datetime αν γίνεται
         ca = data.get("created_at")
         if isinstance(ca, str):
             try:
@@ -321,11 +317,12 @@ class SQLiteStore:
 
     # Runs / History
 
-    def create_run(self, actor: str, run_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Runs / History
 
+    def create_run(self, actor: str, run_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         run_id = str(uuid4())
         created_at = utc_now()
-        entry = {   # Αποθηκεύει record στο Runs/History
+        entry = {
             "run_id": run_id,
             "created_at": created_at.isoformat(),
             "actor": (actor or "").strip(),
@@ -339,19 +336,26 @@ class SQLiteStore:
             )
         return entry
 
-    def list_runs(self, actor: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
-
-        actor = (actor or "").strip()
-        q = "SELECT payload_json FROM runs"
-        params: List[Any] = []
-        if actor:
-            q += " WHERE actor = ?"
-            params.append(actor)
-        q += " ORDER BY created_at DESC LIMIT ?"
-        params.append(int(limit))
+    def list_runs_all(self, limit: int = 200) -> List[Dict[str, Any]]:
 
         with self._conn() as c:
-            rows = c.execute(q, params).fetchall()
+            rows = c.execute(
+                "SELECT payload_json FROM runs ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [_from_json(r["payload_json"]) for r in rows]
+
+    def list_runs_for_user(self, username: str, limit: int = 200) -> List[Dict[str, Any]]:
+
+        username = (username or "").strip()
+        if not username:
+            return []
+
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT payload_json FROM runs WHERE actor = ? ORDER BY created_at DESC LIMIT ?",
+                (username, int(limit)),
+            ).fetchall()
         return [_from_json(r["payload_json"]) for r in rows]
 
     # Blockchain Receipts
@@ -606,6 +610,14 @@ class SQLiteStore:
             row = c.execute("SELECT payload_json FROM fl_jobs WHERE job_id = ?", (jid,)).fetchone()
         return FLJob(**_from_json(row["payload_json"])) if row else None   # Ανάκτηση FL job από sqlite
 
+    def list_fl_jobs(self, limit: int = 200) -> List[FLJob]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT payload_json FROM fl_jobs ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [FLJob(**_from_json(r["payload_json"])) for r in rows]
+
     def update_fl_job(
         self,
         job: FLJob,
@@ -807,10 +819,7 @@ class SQLiteStore:
             items = [x for x in items if _uuid(x.dataset_id) == did]
         return items
 
-
-
 _STORE: Optional[SQLiteStore] = None
-
 
 def get_store() -> SQLiteStore:  # πρόσβαση στο data base
     global _STORE

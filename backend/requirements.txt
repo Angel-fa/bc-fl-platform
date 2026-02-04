@@ -4,3 +4,7 @@ uvicorn
 python-jose[cryptography]
 passlib[bcrypt]
 web3>=6,<7
+
+pandas>=1.5
+numpy>=1.23
+matplotlib

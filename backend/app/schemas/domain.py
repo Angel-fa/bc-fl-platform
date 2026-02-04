@@ -2,15 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
-
-# Επιστρέφει timezone-aware UTC datetime.
-# Γιατί θέλουμε timestamps σε logs και αποφεύγουμε τοπικές datetimes
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -169,6 +166,7 @@ class AccessRequestCreate(BaseModel):
     purpose: str = Field(..., min_length=1, max_length=5000)
     requested_by: str = Field(..., min_length=1)
     role: Role
+    notes: Optional[str] = None
 
 class AccessRequest(AccessRequestCreate): # με lifecycle
     request_id: UUID
@@ -182,10 +180,18 @@ class AccessRequest(AccessRequestCreate): # με lifecycle
 
 class FLJobCreate(BaseModel):
     dataset_id: UUID
+
+    #  single vs multi
+    scope: Literal["single_node", "multi_node"] = "single_node"
+    dataset_ids: List[UUID] = Field(default_factory=list)
+
     rounds: int = Field(..., ge=1, le=100)
     features: List[str] = Field(default_factory=list)
     label: Optional[str] = None
 
+    created_by: Optional[str] = None
+    created_by_org: Optional[str] = None
+    created_by_role: Optional[Role] = None
 
 class FLJob(FLJobCreate):
     job_id: UUID

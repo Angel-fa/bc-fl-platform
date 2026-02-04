@@ -7,6 +7,7 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+import itertools
 import numpy as np
 import pandas as pd
 
@@ -39,7 +40,6 @@ ENRICHED_SAMPLE_CAP = int(os.getenv("ENRICHED_SAMPLE_CAP", "20000"))
 
 # Δημιουργία FastAPI
 app = FastAPI(title="BCFL Hospital Agent")
-
 
 
 # Models
@@ -141,17 +141,68 @@ def _http_post(url: str, payload: dict, timeout: int = 8) -> dict:
         return json.loads(raw) if raw else {}
 
 
+def _normalize_gender(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s == "":
+        return None
+
+    # Αποδεκτές τιμές/συνώνυμα
+    if s in ("m", "male", "man", "άνδρας"):
+        return "male"
+    if s in ("f", "female", "woman", "γυναίκα", "θήλυ", "θηλυκό"):
+        return "female"
+    if s in ("other", "nonbinary", "non-binary", "nb", "άλλο"):
+        return "other"
+
+    return "None"
+
+def _compute_gender_stratified_metrics(
+    df: pd.DataFrame,
+    gender_col: str,
+    features: List[str],
+    outlier_z: float,
+    min_rows_threshold: int,
+) -> Dict[str, Any]:
+    if not gender_col or gender_col not in df.columns:
+        return {}
+
+    work = df.copy()
+    work[gender_col] = work[gender_col].apply(_normalize_gender)
+    work = work.dropna(subset=[gender_col])
+
+    out: Dict[str, Any] = {}
+
+    for gval, gdf in work.groupby(gender_col):
+        group_size = int(len(gdf))
+
+        # Privacy threshold ανά φύλο
+        if group_size < int(min_rows_threshold):
+            out[str(gval)] = {
+                "suppressed": True,
+                "row_count": group_size,
+                "reason": f"group < {min_rows_threshold}",
+            }
+            continue
+
+        fm = _compute_feature_metrics_df(gdf, features, outlier_z)
+
+        out[str(gval)] = {
+            "suppressed": False,
+            "row_count": group_size,
+            "feature_metrics": fm,
+        }
+
+    return out
+
 # Consent
 
 _cons_cache: Dict[str, Dict[str, bool]] = {}
 
 
 def _orchestrator_has_consent(dataset_id: str, patient_id: str) -> bool:
-    """
-    Κάνει call στο orchestrator/backend για να ελέγξει consent.
-    "has_consent": true/false
-    Αν αποτύχει, επιστρέφει False
-    """
+
     try:
         url = f"{ORCHESTRATOR_BASE_URL.rstrip('/')}/consents/has"
         payload = {"dataset_id": dataset_id, "patient_id": patient_id}
@@ -162,10 +213,7 @@ def _orchestrator_has_consent(dataset_id: str, patient_id: str) -> bool:
 
 
 def _has_consent_cached(dataset_id: str, patient_id: str) -> bool:
-    """
-    Αν υπάρχει στο cache, επιστρέφει κατευθείαν.
-    Αλλιώς καλεί orchestrator και αποθηκεύει το αποτέλεσμα.
-    """
+
     ds = (dataset_id or "").strip()
     pid = (patient_id or "").strip()
     if not ds or not pid:
@@ -203,17 +251,17 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
     feature_metrics: Dict[str, Dict[str, Any]] = {}
     variances: Dict[str, float] = {}
 
-    for feat in features:
-        if feat not in df.columns:     # Αν feature δεν υπάρχει στο dataset, το αγνοούμε
-            continue
+    # Κρατάμε μόνο features που υπάρχουν στο df
+    present_features = [f for f in (features or []) if f in df.columns]
 
+    for feat in present_features:
         col = df[feat]
-        missing_rate = float(col.isna().mean())     # missing_rate: ποσοστό NaN/empty
+        missing_rate = float(col.isna().mean())
 
         num = pd.to_numeric(col, errors="coerce")
-        non_na = num.dropna() # Μετατροπή σε numeric όπου γίνεται (non-numeric -> NaN)
+        non_na = num.dropna()
 
-        unique_values = int(col.nunique(dropna=True))      # Εκτίμηση "σταθερότητας" feature, αν είναι drop
+        unique_values = int(col.nunique(dropna=True))
         is_constant = bool(unique_values <= 1)
 
         mean = float(non_na.mean()) if len(non_na) else 0.0
@@ -222,10 +270,10 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
         vmax = float(non_na.max()) if len(non_na) else 0.0
         median = float(non_na.median()) if len(non_na) else 0.0
 
-        iqr = _iqr_stats(non_na) if len(non_na) else {"q1": 0.0, "q3": 0.0, "iqr": 0.0} # Έλεγχος Διασποράς
+        iqr = _iqr_stats(non_na) if len(non_na) else {"q1": 0.0, "q3": 0.0, "iqr": 0.0}
         outlier_rate = _outlier_rate_zscore(non_na, z=3.0) if len(non_na) else 0.0
 
-        var = float(non_na.var(ddof=0)) if len(non_na) else 0.0 # Έλεγχος Διακύμανσης
+        var = float(non_na.var(ddof=0)) if len(non_na) else 0.0
         variances[feat] = var
 
         feature_metrics[feat] = {
@@ -252,25 +300,26 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
 
     # Pearson correlation matrix
     corr_matrix: Dict[str, Dict[str, float]] = {}
-    numeric_df = df[features].apply(pd.to_numeric, errors="coerce")
-    numeric_df = numeric_df.dropna(axis=1, how="all")
-    if numeric_df.shape[1] >= 2:
-        corr = numeric_df.corr(method="pearson")
-        corr_matrix = {c: {r: float(corr.loc[r, c]) for r in corr.index} for c in corr.columns}
+    if len(present_features) >= 2:
+        numeric_df = df[present_features].apply(pd.to_numeric, errors="coerce")
+        numeric_df = numeric_df.dropna(axis=1, how="all")
+        if numeric_df.shape[1] >= 2:
+            corr = numeric_df.corr(method="pearson")
+            corr_matrix = {c: {r: float(corr.loc[r, c]) for r in corr.index} for c in corr.columns}
 
     return {
         "feature_metrics": feature_metrics,
         "normalized_importance": normalized_importance,
         "correlation_matrix": corr_matrix,
+        "present_features": present_features,  # χρήσιμο debug
     }
 
-
-def _compute_feature_means_csv(  #για csv
+def _compute_feature_means_csv(
     path: str,
     features: List[str],
     dataset_id: str,
-    max_rows: int = 200000,)\
-        -> Dict[str, Any]:
+    max_rows: int = 200000,
+) -> Dict[str, Any]:
 
     if not os.path.exists(path):
         return {"ok": False, "error": f"File not found: {path}"}
@@ -284,10 +333,13 @@ def _compute_feature_means_csv(  #για csv
 
     with open(path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+
+        header_cols = set(reader.fieldnames or [])
+
         for row in reader:
             rows_total += 1
 
-            if CONSENT_FILTER_ENABLED:    #  αν είναι allow, κρατάμε μόνο γραμμές που έχουν consent για τον patient_id
+            if CONSENT_FILTER_ENABLED:
                 pid = (row.get(PATIENT_ID_COLUMN) or "").strip()
                 if not pid or not _has_consent_cached(dataset_id, pid):
                     rows_skipped_no_consent += 1
@@ -298,6 +350,9 @@ def _compute_feature_means_csv(  #για csv
             rows_used += 1
 
             for feat in features:
+                if feat not in header_cols:
+                    continue
+
                 v = _safe_float(row.get(feat))
                 if v is not None:
                     sums[feat] += v
@@ -307,15 +362,15 @@ def _compute_feature_means_csv(  #για csv
                 break
 
     means: Dict[str, float] = {}
-    for feat in features:
-        means[feat] = (sums[feat] / float(counts[feat])) if counts[feat] > 0 else 0.0
-    try:
-        df = pd.read_csv(path, nrows=max_rows)
-        enriched = _compute_enriched_feature_metrics_df(df, features)
-    except Exception:
-        enriched = {"feature_metrics": {}, "normalized_importance": {}, "correlation_matrix": {}}
+    missing_features: List[str] = []
 
-     # streaming aggregation
+    # αν count==0 -> δεν το βάζουμε στο update
+    for feat in features:
+        if counts[feat] > 0:
+            means[feat] = sums[feat] / float(counts[feat])
+        else:
+            missing_features.append(feat)
+
     return {
         "ok": True,
         "row_count": rows_total,
@@ -326,20 +381,16 @@ def _compute_feature_means_csv(  #για csv
             "rows_skipped_no_consent": rows_skipped_no_consent,
             "consent_filter_enabled": CONSENT_FILTER_ENABLED,
             "patient_id_column": PATIENT_ID_COLUMN if CONSENT_FILTER_ENABLED else None,
-            # Enriched
-            "feature_metrics": enriched.get("feature_metrics", {}),
-            "normalized_importance": enriched.get("normalized_importance", {}),
-            "correlation_matrix": enriched.get("correlation_matrix", {}),
+            "missing_features": missing_features,
         },
     }
 
-
-def _compute_feature_means_xlsx(  #για excel
+def _compute_feature_means_xlsx(
     path: str,
     features: List[str],
     dataset_id: str,
-    max_rows: int = 200000,)\
-        -> Dict[str, Any]:
+    max_rows: int = 200000,
+) -> Dict[str, Any]:
 
     if not os.path.exists(path):
         return {"ok": False, "error": f"File not found: {path}"}
@@ -363,7 +414,6 @@ def _compute_feature_means_xlsx(  #για excel
     rows_used = 0
     rows_skipped_no_consent = 0
 
-    # iterate rows (data starts at row 2)
     for row in ws.iter_rows(min_row=2, max_row=1 + max_rows, values_only=True):
         rows_total += 1
 
@@ -387,14 +437,13 @@ def _compute_feature_means_xlsx(  #για excel
                 counts[feat] += 1
 
     means: Dict[str, float] = {}
-    for feat in features:
-        means[feat] = (sums[feat] / float(counts[feat])) if counts[feat] > 0 else 0.0
+    missing_features: List[str] = []
 
-    try:
-        df = pd.read_excel(path, nrows=max_rows)
-        enriched = _compute_enriched_feature_metrics_df(df, features)
-    except Exception:
-        enriched = {"feature_metrics": {}, "normalized_importance": {}, "correlation_matrix": {}}
+    for feat in features:
+        if counts[feat] > 0:
+            means[feat] = sums[feat] / float(counts[feat])
+        else:
+            missing_features.append(feat)
 
     return {
         "ok": True,
@@ -406,14 +455,9 @@ def _compute_feature_means_xlsx(  #για excel
             "rows_skipped_no_consent": rows_skipped_no_consent,
             "consent_filter_enabled": CONSENT_FILTER_ENABLED,
             "patient_id_column": PATIENT_ID_COLUMN if CONSENT_FILTER_ENABLED else None,
-
-            # Enriched (optional)
-            "feature_metrics": enriched.get("feature_metrics", {}),
-            "normalized_importance": enriched.get("normalized_importance", {}),
-            "correlation_matrix": enriched.get("correlation_matrix", {}),
+            "missing_features": missing_features,
         },
     }
-
 
 def _compute_feature_means(
         path: str, features: List[str],
@@ -453,7 +497,6 @@ def _compute_feature_metrics_df(df: pd.DataFrame, features: List[str], outlier_z
         total = int(len(s_raw))
         missing = int(s_raw.isna().sum())
 
-        # Δοκιμή numeric conversion
         s_num = pd.to_numeric(s_raw, errors="coerce")
         non_na = s_num.dropna()
 
@@ -531,7 +574,68 @@ def _compute_stratified_metrics(df: pd.DataFrame, stratify_by: str, features: Li
 
     return out
 
+def _compute_sufficient_stats_df(df: pd.DataFrame, features: List[str]) -> Dict[str, Any]:
+    present = [f for f in (features or []) if f in df.columns]
+    if not present:
+        return {"present_features": [], "feature_sums": {}, "pair_sums": {}}
 
+    numeric_df = df[present].apply(pd.to_numeric, errors="coerce")
+
+    feature_sums: Dict[str, dict] = {}
+    for f in present:
+        s = numeric_df[f]
+        total_rows = int(len(s))
+        n = int(s.notna().sum())
+        missing = int(total_rows - n)
+
+        if n > 0:
+            x = s.dropna().to_numpy(dtype=float)
+            feature_sums[f] = {
+                "total_rows": total_rows,
+                "n": n,
+                "missing": missing,
+                "sum": float(np.sum(x)),
+                "sumsq": float(np.sum(x * x)),
+                "min": float(np.min(x)),
+                "max": float(np.max(x)),
+            }
+        else:
+            feature_sums[f] = {
+                "total_rows": total_rows,
+                "n": 0,
+                "missing": missing,
+                "sum": 0.0,
+                "sumsq": 0.0,
+                "min": None,
+                "max": None,
+            }
+
+    pair_sums: Dict[str, dict] = {}
+    for a, b in itertools.combinations(present, 2):
+        xa = numeric_df[a]
+        xb = numeric_df[b]
+        mask = xa.notna() & xb.notna()
+        n = int(mask.sum())
+        key = f"{a}||{b}"
+        if n > 0:
+            A = xa[mask].to_numpy(dtype=float)
+            B = xb[mask].to_numpy(dtype=float)
+            pair_sums[key] = {
+                "n": n,
+                "sum_x": float(np.sum(A)),
+                "sum_y": float(np.sum(B)),
+                "sum_x2": float(np.sum(A * A)),
+                "sum_y2": float(np.sum(B * B)),
+                "sum_xy": float(np.sum(A * B)),
+            }
+        else:
+            pair_sums[key] = {"n": 0, "sum_x": 0.0, "sum_y": 0.0, "sum_x2": 0.0, "sum_y2": 0.0, "sum_xy": 0.0}
+
+    return {
+        "present_features": present,
+        "feature_sums": feature_sums,
+        "pair_sums": pair_sums,
+    }
 
 # Routes
 
@@ -599,11 +703,13 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             "error": "Provide features list",
             "row_count": 0,
             "update": {},
-            "feature_metrics": {},
-            "stratified_metrics": {},
             "suppressed": False,
             "min_row_threshold": MIN_ROWS_THRESHOLD,
-            "metrics": {},
+            "metrics": {
+                "feature_metrics": {},
+                "stratified_metrics": {},
+                "privacy": {"min_row_threshold": MIN_ROWS_THRESHOLD},
+            },
         }
 
 
@@ -622,30 +728,28 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
         }
 
     row_count = int(base.get("row_count") or 0)
+    effective_row_count = int((base.get("metrics") or {}).get("rows_used") or 0)
 
-
-    if row_count < MIN_ROWS_THRESHOLD:
+    if effective_row_count < MIN_ROWS_THRESHOLD:
         return {
             "ok": True,
             "row_count": row_count,
-            "update": {},  # suppressed: κρύβουμε aggregates
-            "feature_metrics": {},
-            "stratified_metrics": {},
+            "update": {},
             "suppressed": True,
             "min_row_threshold": MIN_ROWS_THRESHOLD,
             "metrics": {
                 **(base.get("metrics") or {}),
                 "privacy": {"min_row_threshold": MIN_ROWS_THRESHOLD, "suppressed": True},
+                "effective_row_count": effective_row_count,
+                "sufficient_stats": {},
             },
         }
-
-
-    feature_metrics: Dict[str, Any] = {}
-    stratified_metrics: Dict[str, Any] = {}
 
     if CONSENT_FILTER_ENABLED:
         feature_metrics = {}
         stratified_metrics = {}
+        correlation_matrix = {}
+        normalized_importance = {}
     else:
         try:
             cols_needed = list(features)
@@ -653,28 +757,64 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
                 cols_needed.append(req.stratify_by)
 
             df = _read_df_for_metrics(req.local_uri, cols_needed, max_rows=200000)
+            sufficient_stats = _compute_sufficient_stats_df(df, features)
 
-            feature_metrics = _compute_feature_metrics_df(df, features, OUTLIER_Z)  # Metrics per feature
+            if ENRICHED_METRICS_ENABLED:
+                df_enriched = df
+                if ENRICHED_SAMPLE_CAP and len(df) > ENRICHED_SAMPLE_CAP:
+                    df_enriched = df.sample(n=ENRICHED_SAMPLE_CAP, random_state=42)
 
-            # Stratified metrics (δεν έχει υλοποιηθεί πλήρως ακόμη...π.χ. gender -> male/female)
-            if req.stratify_by:
-                stratified_metrics = _compute_stratified_metrics(df, req.stratify_by, features, OUTLIER_Z)
+                enriched = _compute_enriched_feature_metrics_df(df_enriched, features)
+
+                feature_metrics = enriched.get("feature_metrics", {})
+                # Τα βάζουμε στο metrics για να τα πάρει το UI
+                correlation_matrix = enriched.get("correlation_matrix", {})
+                normalized_importance = enriched.get("normalized_importance", {})
+            else:
+                feature_metrics = _compute_feature_metrics_df(df, features, OUTLIER_Z)
+                correlation_matrix = {}
+                normalized_importance = {}
+
+            # Stratified metrics: ΜΟΝΟ για gender, με normalization + privacy threshold ανά group
+            if req.stratify_by and req.stratify_by.strip().lower() == "gender":
+                stratified_metrics = _compute_gender_stratified_metrics(
+                    df=df,
+                    gender_col=req.stratify_by,
+                    features=features,
+                    outlier_z=OUTLIER_Z,
+                    min_rows_threshold=MIN_ROWS_THRESHOLD,
+                )
+            else:
+                stratified_metrics = {}
         except Exception:
             feature_metrics = {}
             stratified_metrics = {}
+            sufficient_stats = {"present_features": [], "feature_sums": {}, "pair_sums": {}}
+            correlation_matrix = {}
+            normalized_importance = {}
 
-    return {
+        return {
         "ok": True,
         "row_count": row_count,
         "update": base.get("update") or {},
-        "feature_metrics": feature_metrics,
-        "stratified_metrics": stratified_metrics,
         "suppressed": False,
         "min_row_threshold": MIN_ROWS_THRESHOLD,
         "metrics": {
             **(base.get("metrics") or {}),
             "privacy": {"min_row_threshold": MIN_ROWS_THRESHOLD, "suppressed": False},
+            "effective_row_count": effective_row_count,
             "outlier_z": OUTLIER_Z,
+
+            "requested_features": features,
+            "missing_features": (base.get("metrics") or {}).get("missing_features", []),
+            "present_features": (base.get("metrics") or {}).get("present_features", []),
+
+            "feature_metrics": feature_metrics,
+            "stratified_metrics": stratified_metrics,
+            "sufficient_stats": sufficient_stats,
+            "correlation_matrix": correlation_matrix,
+            "normalized_importance": normalized_importance,
+
         },
     }
 
@@ -709,3 +849,4 @@ def startup_register():
         _http_post(url, payload, timeout=8)
     except Exception:
         pass
+

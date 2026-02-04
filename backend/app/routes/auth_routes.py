@@ -15,7 +15,8 @@ from app.auth import (
     require_roles,
     ROLE_BIOBANK,
     ROLE_HOSPITAL,
-    ROLE_RESEARCHER
+    ROLE_RESEARCHER,
+    ROLE_ADMIN
 )
 
 router = APIRouter()
@@ -28,7 +29,7 @@ PASSWORD_SALT = os.getenv("PASSWORD_SALT", "dev-salt-change-me")
 
 HOSPITAL_INVITE_CODE = os.getenv("HOSPITAL_INVITE_CODE", "HOSPITAL2026")
 BIOBANK_INVITE_CODE = os.getenv("BIOBANK_INVITE_CODE", "BIOBANK2026")
-
+ADMIN_INVITE_CODE  = os.getenv("ADMIN_INVITE_CODE", "ADMIN-security")
 
 def _hash_password(pw: str) -> str:
     x = (PASSWORD_SALT + pw).encode("utf-8")
@@ -81,6 +82,9 @@ def register(payload: RegisterIn):
     elif role == ROLE_BIOBANK:
         if (payload.invite_code or "").strip() != BIOBANK_INVITE_CODE:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid biobank invite code")
+    elif role == ROLE_ADMIN:
+        if (payload.invite_code or "").strip() != ADMIN_INVITE_CODE:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid biobank invite code")
     elif role == ROLE_RESEARCHER:
         pass
     else:
@@ -132,20 +136,16 @@ def login(payload: LoginIn):
 
 
 @router.get("/me", response_model=UserOut)
-def me(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, "Admin"))):
-    """
-    Επιστρέφει τα στοιχεία του συνδεδεμένου χρήστη από τη βάση
-    Χρήσιμο για να βλέπει το UI αν ο χρήστης έγινε inactive, αλλαγές org/role κ.λπ.
-    """
+def me(actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN))):
+
     store = get_store()
 
-    # Παίρνουμε τον user από τη βάση, με βάση το username του actor (από token)
     u = store.get_user(actor.username.strip())
 
-    if not u:  #404 αν δεν υπάρχει ο user στη βάση
+    if not u:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    if not u["is_active"]: #403 αν ο Admin κάνει κάποιον inactive
+    if not u["is_active"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
     return UserOut(

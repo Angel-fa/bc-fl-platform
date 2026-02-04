@@ -25,10 +25,9 @@ def sha256_hex(obj: Any) -> str:
 
 
 def sha256_hex_str(s: str) -> str:
-    b = (s or "").encode("utf-8")  # όταν θέλουμε να τραβήξουμε hash και όχι raw data (για str)
+    b = (s or "").encode("utf-8")
     return hashlib.sha256(b).hexdigest()
 
-# Μετατρέπει ένα hex hash (64 χαρακτήρες) σε bytes 32, γιατί τα smart contracts συνήθως θέλουν bytes32
 def _hex_to_bytes32(hex_str: str) -> bytes:
     h = (hex_str or "").strip().lower()
     if h.startswith("0x"):
@@ -83,7 +82,6 @@ class BlockchainService:   # κάθε συμβόλαιο πρέπει να έχ�
         raise NotImplementedError
 
 
-
 class NoopBlockchainService(BlockchainService):
 
     _consent_mem: Dict[str, Dict[str, bool]] = {}
@@ -111,13 +109,17 @@ class NoopBlockchainService(BlockchainService):
                 "payload_hash": payload_hash,
                 "manifest": manifest,
 
-                # pseudo metrics for uniform analysis
                 "status": 1,
-                "block_number": None,
+                "block_number": 0,
+                "block_timestamp": int(time.time()),
                 "gas_used": 0,
                 "effective_gas_price": 0,
                 "tx_cost_wei": 0,
                 "latency_ms": int(round((t1 - t0) * 1000.0)),
+
+                "offchain_compute_ms": int(round((t1 - t0) * 1000.0)),
+                "payload_bytes": len(_canonical_json(manifest).encode("utf-8")),
+                "hash_alg": "sha256",
             },
             tx_hash=None,
             chain_id=None,
@@ -132,7 +134,7 @@ class NoopBlockchainService(BlockchainService):
             contract_address=None,
             receipt_id=None,
             status=1,
-            block_number=None,
+            block_number=0,
             gas_used=0,
             effective_gas_price=0,
             tx_cost_wei=0,
@@ -203,6 +205,7 @@ class Web3BlockchainService(BlockchainService):
         self.receipt_contract = self.w3.eth.contract(address=self.receipt_address, abi=receipt_abi)
         self.consent_contract = self.w3.eth.contract(address=self.consent_address, abi=consent_abi)
 
+    @staticmethod
     def _safe_get(receipt_obj: Any, key: str) -> Any:
         try:
             if hasattr(receipt_obj, "get"):
@@ -259,19 +262,18 @@ class Web3BlockchainService(BlockchainService):
         block_number = None
 
         try:
-            v = _safe_get(receipt, "gasUsed")
+            v = self._safe_get(receipt, "gasUsed")
             gas_used = int(v) if v is not None else None
         except Exception:
             gas_used = None
 
         try:
-            v = _safe_get(receipt, "effectiveGasPrice")
+            v = self._safe_get(receipt, "effectiveGasPrice")
             effective_gas_price = int(v) if v is not None else None
         except Exception:
             effective_gas_price = None
 
         if effective_gas_price is None:
-            # fallback: if tx had gasPrice / maxFeePerGas
             try:
                 if "gasPrice" in tx:
                     effective_gas_price = int(tx["gasPrice"])
@@ -288,16 +290,33 @@ class Web3BlockchainService(BlockchainService):
                 tx_cost_wei = None
 
         try:
-            v = _safe_get(receipt, "status")
+            v = self._safe_get(receipt, "status")
             status = int(v) if v is not None else None
         except Exception:
             status = None
 
         try:
-            v = _safe_get(receipt, "blockNumber")
+            v = self._safe_get(receipt, "blockNumber")
             block_number = int(v) if v is not None else None
         except Exception:
             block_number = None
+
+        # block timestamp
+        block_timestamp = None
+        try:
+            bn = block_number
+            if bn is None:
+                bn = self._safe_get(receipt, "blockNumber")
+                bn = int(bn) if bn is not None else None
+            if bn:
+                block = self.w3.eth.get_block(int(bn))
+                # web3 returns AttributeDict; both styles work
+                bt = getattr(block, "timestamp", None)
+                if bt is None and hasattr(block, "get"):
+                    bt = block.get("timestamp")
+                block_timestamp = int(bt) if bt is not None else None
+        except Exception:
+            block_timestamp = None
 
         metrics = {
             "latency_ms": latency_ms,
@@ -306,11 +325,14 @@ class Web3BlockchainService(BlockchainService):
             "tx_cost_wei": tx_cost_wei,
             "status": status,
             "block_number": block_number,
+            "block_timestamp": block_timestamp,
         }
 
         return tx_hash, receipt, metrics
 
     def anchor(self, event_type: str, ref_id: str, payload: Dict[str, Any], actor: Actor) -> AnchorReceipt:
+        t0_all = time.perf_counter()
+
         manifest = {
             "event_type": event_type,
             "ref_id": ref_id,
@@ -333,7 +355,18 @@ class Web3BlockchainService(BlockchainService):
 
         tx_hash, receipt, metrics = self._send_tx(fn)
 
-        # Προσπάθεια εξαγωγής receiptId από event logs
+        t1_all = time.perf_counter()
+        offchain_compute_ms = int(round((t1_all - t0_all) * 1000.0))
+
+        payload_bytes = len(_canonical_json(manifest).encode("utf-8"))
+
+        bn = metrics.get("block_number")
+        if bn is None:
+            try:
+                bn = int(getattr(receipt, "blockNumber", None) or receipt.get("blockNumber"))
+            except Exception:
+                bn = None
+
         receipt_id_hex: Optional[str] = None
         try:
             events = self.receipt_contract.events.ReceiptAnchored().process_receipt(receipt)
@@ -344,11 +377,8 @@ class Web3BlockchainService(BlockchainService):
             receipt_id_hex = None
 
         # Block timestamp
-        try:
-            bn = int(metrics.get("block_number") or getattr(receipt, "blockNumber", 0) or 0)
-            block = self.w3.eth.get_block(bn) if bn else self.w3.eth.get_block("latest")
-            block_ts = int(block.timestamp)
-        except Exception:
+        block_ts = metrics.get("block_timestamp")
+        if block_ts is None:
             block_ts = int(time.time())
 
         store = get_store()
@@ -361,21 +391,22 @@ class Web3BlockchainService(BlockchainService):
                 "actor_hash": actor_hash_hex,
                 "manifest": manifest,
 
-                # core receipt references
                 "tx_hash": tx_hash,
                 "contract_address": self.receipt_address,
                 "receipt_id": receipt_id_hex,
 
-                # chain/receipt fields
                 "status": metrics.get("status"),
-                "block_number": metrics.get("block_number"),
+                "block_number": bn,
                 "block_timestamp": block_ts,
 
-                # evaluation metrics
                 "gas_used": metrics.get("gas_used"),
                 "effective_gas_price": metrics.get("effective_gas_price"),
                 "tx_cost_wei": metrics.get("tx_cost_wei"),
                 "latency_ms": metrics.get("latency_ms"),
+
+                "offchain_compute_ms": offchain_compute_ms,
+                "payload_bytes": payload_bytes,
+                "hash_alg": "sha256",
             },
             tx_hash=tx_hash,
             chain_id=str(self.chain_id),
@@ -390,7 +421,7 @@ class Web3BlockchainService(BlockchainService):
             contract_address=self.receipt_address,
             receipt_id=receipt_id_hex,
             status=metrics.get("status"),
-            block_number=metrics.get("block_number"),
+            block_number=bn,
             gas_used=metrics.get("gas_used"),
             effective_gas_price=metrics.get("effective_gas_price"),
             tx_cost_wei=metrics.get("tx_cost_wei"),
@@ -416,33 +447,61 @@ class Web3BlockchainService(BlockchainService):
         dataset_key = self._dataset_key(ds)
         patient_key = _hex_to_bytes32(pk)
 
-        fn = self.consent_contract.functions.setConsent(dataset_key, patient_key, bool(allowed))
+        fn = self.consent_contract.functions.setRowConsent(dataset_key, patient_key, bool(allowed))
+
+         #  START OFFCHAIN TIMER
+        t0 = time.perf_counter()
+
         tx_hash, receipt, metrics = self._send_tx(fn)
+
+        #  END OFFCHAIN TIMER
+        t1 = time.perf_counter()
+        offchain_compute_ms = int(round((t1 - t0) * 1000.0))
+
+        bn = metrics.get("block_number")
+        if bn is None:
+            try:
+                bn = int(getattr(receipt, "blockNumber", None) or receipt.get("blockNumber"))
+            except Exception:
+                bn = None
 
         # Dedicated receipt -> PATIENT_CONSENT_TX
         try:
             store = get_store()
+
+            block_ts = metrics.get("block_timestamp")
+            if block_ts is None:
+                block_ts = int(time.time())
+
+            payload = {
+                "mode": "contract",
+                "dataset_id": ds,
+                "dataset_key": Web3.to_hex(dataset_key),
+                "patient_key": "0x" + pk,
+                "allowed": bool(allowed),
+
+                "contract_address": self.consent_address,
+                "tx_hash": tx_hash,
+
+                "status": metrics.get("status"),
+                "block_number": bn,
+                "block_timestamp": block_ts,
+
+                "gas_used": metrics.get("gas_used"),
+                "effective_gas_price": metrics.get("effective_gas_price"),
+                "tx_cost_wei": metrics.get("tx_cost_wei"),
+                "latency_ms": metrics.get("latency_ms"),
+
+                "offchain_compute_ms": offchain_compute_ms,
+                "hash_alg": "sha256",
+            }
+
+            payload["payload_bytes"] = len(_canonical_json(payload).encode("utf-8"))
+
             store.save_bc_receipt(
                 event_type="PATIENT_CONSENT_TX",
                 ref_id=f"{ds}:{pk}",
-                payload={
-                    "mode": "contract",
-                    "dataset_id": ds,
-                    "dataset_key": Web3.to_hex(dataset_key),
-                    "patient_key": "0x" + pk,
-                    "allowed": bool(allowed),
-
-                    "contract_address": self.consent_address,
-                    "tx_hash": tx_hash,
-
-                    # evaluation metrics for Smart Contract
-                    "status": metrics.get("status"),
-                    "block_number": metrics.get("block_number"),
-                    "gas_used": metrics.get("gas_used"),
-                    "effective_gas_price": metrics.get("effective_gas_price"),
-                    "tx_cost_wei": metrics.get("tx_cost_wei"),
-                    "latency_ms": metrics.get("latency_ms"),
-                },
+                payload=payload,
                 tx_hash=tx_hash,
                 chain_id=str(self.chain_id),
             )
@@ -479,7 +538,6 @@ class Web3BlockchainService(BlockchainService):
         }
 
     def has_patient_consent(self, dataset_id: str, patient_key_hex: str) -> bool:
-
         ds = (dataset_id or "").strip()
         pk = (patient_key_hex or "").strip().lower()
         if pk.startswith("0x"):
@@ -488,13 +546,19 @@ class Web3BlockchainService(BlockchainService):
             return False
 
         dataset_key = self._dataset_key(ds)
-        patient_key = _hex_to_bytes32(pk)
+        row_id = _hex_to_bytes32(pk)
+
         try:
-            return bool(self.consent_contract.functions.hasConsent(dataset_key, patient_key).call())
+            exists, allowed, _ts = self.consent_contract.functions.getRowConsent(
+                self.acct.address,
+                dataset_key,
+                row_id,
+            ).call()
+
+            return bool(exists and allowed)
+
         except Exception:
             return False
-
-
 
 
 _BC: Optional[BlockchainService] = None

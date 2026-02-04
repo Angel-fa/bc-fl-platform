@@ -48,6 +48,7 @@ services:
 
       - HOSPITAL_INVITE_CODE=HOSPITAL2026
       - BIOBANK_INVITE_CODE=BIOBANK2026
+      - ADMIN_INVITE_CODE=ADMIN-security
     depends_on:
       anvil:
         condition: service_healthy
