@@ -898,7 +898,6 @@ def start_fl_job(
     try:
         global_model: dict = {}
 
-        # RESET per-run/per-round
         merged = dict(job.metrics or {})
 
         merged["round_durations_sec"] = []
@@ -937,7 +936,6 @@ def start_fl_job(
             round_weights = []
             round_nodes = []
 
-            # NEW: collect sufficient stats from all nodes
             round_suffs: List[dict] = []
             present_features_union: List[str] = []
             min_row_thresholds: List[int] = []
@@ -1003,7 +1001,6 @@ def start_fl_job(
                 if is_suppressed:
                     any_suppressed = True
 
-                # sufficient stats (only if not suppressed)
                 if (not is_suppressed) and isinstance(node_metrics, dict):
                     suff = node_metrics.get("sufficient_stats") or {}
                     if isinstance(suff, dict) and suff:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from typing import Any, Dict, Optional, List
@@ -13,6 +14,7 @@ import numpy as np
 import requests
 import streamlit as st
 from PIL import Image
+
 
 
 DEFAULT_BASE_URL = os.getenv("API_BASE_URL", "http://backend:8000/api/v1")
@@ -31,10 +33,10 @@ EXPORT_METHODS = ["federated", "aggregated", "synthetic"]
 
 # Ποιες σελίδες εμφανίζονται σε κάθε ρόλο
 PAGES_BY_ROLE = {
-    "Admin": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
-    "Hospital": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
-    "Biobank": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
-    "Researcher": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "Runs / History", "Settings"],
+    "Admin": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "History", "Settings"],
+    "Hospital": ["Dashboard", "Nodes", "Datasets", "Consents", "Access Requests", "Federated Jobs", "Smart Contract", "History", "Settings"],
+    "Biobank": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "History", "Settings"],
+    "Researcher": ["Dashboard", "Nodes", "Datasets", "Access Requests", "Federated Jobs", "Smart Contract", "History", "Settings"],
 }
 
 
@@ -143,14 +145,14 @@ def _json_size_kb(obj: Any) -> float:
     except Exception:
         return 0.0
 
-def log_run(run_type: str, payload: Dict[str, Any]) -> None:  # Καταγράφει “ιστορικό ενεργειών” (Runs / History) στο backend
+def log_run(run_type: str, payload: Dict[str, Any]) -> None:
     try:
         api_post("/runs", payload={"run_type": run_type, "payload": payload})
     except Exception:
         pass
 
 
-def require_login() -> None: # stop αν δεν δηλωθεί σωστό authentication
+def require_login() -> None:
     if not st.session_state.get("token"):
         st.info("Please login to continue.")
         st.stop()
@@ -158,7 +160,7 @@ def require_login() -> None: # stop αν δεν δηλωθεί σωστό authen
 
 def _dataset_columns(ds: Dict[str, Any]) -> List[str]:
     cols = ds.get("columns") or []
-    return [str(x) for x in cols if str(x).strip()] #  Επιστρέφει τα columns που έχει επιστρέψει το backend μετά από validate.
+    return [str(x) for x in cols if str(x).strip()]
 
 
 def _dataset_exposed_features(ds: Dict[str, Any]) -> List[str]:
@@ -341,137 +343,242 @@ def flash_show() -> None:
 
 
 # UI: Auth
-
 def ui_login_register() -> None:
+    import os
+    import base64
+    import streamlit as st
 
-    st.title("Πλατφόρμα Συνεργατικής Ιατρικής Ανάλυσης / BC-FL")
-    st.markdown("### ")
+    # Background image από assets -> data URI
+    bg_file = "health-bio.png"
+    bg_path = _assets_path(bg_file)
 
-    # Layout για logos (κεντραρισμένα)
-    f1, f2, f3 = st.columns([1, 2, 1])
-    with f2:
-        s1, gap, s2 = st.columns([1, 0.25, 1])
-        with s1:
-            st.image(_assets_path("logo_1.png"), width=440)
-        with gap:
-            st.empty()
-        with s2:
-            st.image(_assets_path("logo_2.jpg"), width=440)
+    def _to_data_uri(path: str) -> str:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode("utf-8")
+            ext = os.path.splitext(path)[1].lower().replace(".", "")
+            mime = "png" if ext == "png" else ("jpeg" if ext in ("jpg", "jpeg") else "png")
+            return f"data:image/{mime};base64,{b64}"
+        except Exception:
+            return ""
 
-    # Δύο στήλες: αριστερά login, δεξιά register
-    c1, c2 = st.columns(2)
+    bg_data_uri = _to_data_uri(bg_path)
 
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"] {{
+            padding: 0 !important;
+            margin: 0 !important;
+        }}
+        .block-container {{
+            max-width: 100% !important;
+            padding-left: 0rem !important;
+            padding-right: 0rem !important;
+            padding-top: 0.5rem !important;
+        }}
 
-    # Login
+        .stApp {{
+            background-image: url("{bg_data_uri}");
+            background-repeat: no-repeat;
+            background-position: center center;
+            background-size: cover;        
+            background-attachment: fixed;
+            background-color: #0b1220;     
+        }}
 
-    with c1:
-        st.subheader("Login")
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
+        .bcfl-overlay {{
+            position: fixed;
+            inset: 0;
+            background: rgba(8, 15, 28, 0.18);  
+            pointer-events: none;
+            z-index: 0;
+        }}
 
-        # Το κουμπί Login κάνει call στο backend για token.
-        if st.button("Login", type="primary"):
-            try:
+        .bcfl-wrap {{
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            padding: 24px 24px 0 24px;
+        }}
 
-                resp = api_post("/auth/login", {"username": username, "password": password})
-                st.session_state["token"] = resp["access_token"]
-
-                user = resp["user"]
-                st.session_state["username"] = user["username"]
-                st.session_state["role"] = user["role"]
-                st.session_state["org"] = user["org"]
-
-                st.success("Logged in.")
-
-                # καταγραφή run history
-                log_run("auth.login", {"username": username, "role": user.get("role"), "org": user.get("org")})
-
-                # rerun για να αλλάξει σε logged in  και να ανοίξει navigation
-                st.rerun()
-
-            except Exception as e:
-                # Σε αποτυχία login -> clear keys
-                for k in ("token", "username", "role", "org"):
-                    st.session_state.pop(k, None)
-                st.error(str(e))
-
-
-    # Register
-
-    with c2:
-        st.subheader("Register")
-        r_username = st.text_input("New username", key="reg_username")
-        r_password = st.text_input("New password", type="password", key="reg_password")
-        r_role = st.selectbox("Role", ROLES, index=1, key="reg_role")
-        r_org = st.text_input(
-            "Organization",
-            key="reg_org",
-            placeholder="e.g., Hospital A / Biobank Center / Research Lab",
-        )
-
-        # Για Admin/Hospital/Biobank απαιτείται invite_code
-        invite_code = ""
-        if r_role in ("Admin", "Hospital", "Biobank"):
-            invite_code = st.text_input(
-                "Invite code",
-                key="reg_invite_code",
-                help="Required for Admin/Hospital/Biobank registration.",
-            )
-
-        if st.button("Register"):
-            try:
-                payload = {"username": r_username, "password": r_password, "role": r_role, "org": r_org}
-                if r_role in ("Admin","Hospital", "Biobank"):
-                    payload["invite_code"] = invite_code
-
-                api_post("/auth/register", payload)
-
-                st.success("Registered. You can now login.")
-                log_run("auth.register", {"username": r_username, "role": r_role, "org": r_org})
-
-            except Exception as e:
-                st.error(str(e))
-
-    st.divider()
+        .bcfl-hero {{
+            margin: 6px auto 14px auto;
+            text-align: center;
+        }}
+        .bcfl-hero h1 {{
+            margin: 0;
+            font-size: 2.1rem;
+            font-weight: 800;
+            color: #ffffff;
+            letter-spacing: -0.02em;
+            text-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        }}
+        .bcfl-hero p {{
+            margin: 8px 0 0 0;
+            font-size: 1.05rem;
+            color: rgba(255,255,255,0.88);
+            text-shadow: 0 10px 30px rgba(0,0,0,0.30);
+        }}
 
 
-    # Public Patient Consent
-    st.subheader("Patient Consent (Public Portal)")
-    patient_id = st.text_input("Patient Pseudonymous ID (e.g., PAT-0001)", key="pt_patient_id")
-    dataset_id = st.text_input("Dataset ID", key="pt_dataset_id", help="Paste the dataset_id you were given.")
-    decision = st.selectbox("Decision", ["allow", "deny"], key="pt_decision")
-    portal_secret = st.text_input(
-        "Portal Secret",
-        type="password",
-        key="pt_secret",
-        help="Set PATIENT_PORTAL_SECRET in backend env.",
+        .auth-card {{
+            background: rgba(255,255,255,0.92);
+            border: 1px solid rgba(15,23,42,0.10);
+            box-shadow: 0 18px 45px rgba(0,0,0,0.20);
+            border-radius: 18px;
+            padding: 18px;
+            width: 100%;
+            max-width: 520px; 
+        }}
+
+        div[data-testid="stTextInput"] label,
+        div[data-testid="stSelectbox"] label {{
+            font-weight: 700;
+            color: #0f172a;
+        }}
+
+        [data-testid="stMarkdownContainer"] h1 a,
+        [data-testid="stMarkdownContainer"] h2 a,
+        [data-testid="stMarkdownContainer"] h3 a {{
+            display: none !important;
+        }}
+
+        </style>
+
+        <div class="bcfl-overlay"></div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # Όταν πατηθεί Submit
-    if st.button("Submit Consent", key="pt_submit", type="primary"):
-        try:
-            payload = {
-                "dataset_id": dataset_id,
-                "patient_id": patient_id,
-                "decision": decision,
-                "secret": portal_secret,
-            }
-            resp = api_post("/public/consent", payload)
-            st.success("Consent recorded on-chain")
 
-            st.code(f"""
-            event_type        : {resp.get('event_type')}
-            ref_id            : {resp.get('ref_id')}
-            tx_hash           : {resp.get('tx_hash')}
-            chain_id          : {resp.get('chain_id')}
-            contract_address  : {resp.get('contract_address')}
-            payload_hash      : {resp.get('payload_hash')}
-            """, language="text")
-        except Exception as e:
-            st.error(str(e))
+    st.markdown(
+        """
+        <div class="bcfl-wrap">
+            <div class="bcfl-hero">
+                <h1>Πλατφόρμα Συνεργατικής Ιατρικής Ανάλυσης</h1>
+                <p>BC-FL Platform</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def ui_topbar() -> None: # πάνω τμήμα της σελίδας όταν συνδεθείς
+    spacer, left_col, right_col = st.columns([0.08, 0.47, 0.45])
+
+    with left_col:
+
+        tab_login, tab_reg = st.tabs(["Είσοδος", "Εγγραφή"])
+        #st.markdown('<div class="auth-card">', unsafe_allow_html=True)
+
+        # Login
+        with tab_login:
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+
+            if st.button("Login", type="primary", use_container_width=True, key="login_btn"):
+                try:
+                    resp = api_post("/auth/login", {"username": username, "password": password})
+                    st.session_state["token"] = resp["access_token"]
+
+                    user = resp["user"]
+                    st.session_state["username"] = user["username"]
+                    st.session_state["role"] = user["role"]
+                    st.session_state["org"] = user["org"]
+
+                    st.success("Σύνδεση επιτυχής!")
+                    log_run("auth.login", {"username": username, "role": user.get("role"), "org": user.get("org")})
+                    st.rerun()
+                except Exception as e:
+                    for k in ("token", "username", "role", "org"):
+                        st.session_state.pop(k, None)
+                    st.error(str(e))
+
+        # Register
+        with tab_reg:
+            r_username = st.text_input("New username", key="reg_username")
+            r_password = st.text_input("New password", type="password", key="reg_password")
+            r_role = st.selectbox("Role", ROLES, index=1, key="reg_role")
+            r_org = st.text_input(
+                "Organization",
+                key="reg_org",
+                placeholder="e.g., Hospital A / Biobank Center / Research Lab",
+            )
+
+            invite_code = ""
+            if r_role in ("Admin", "Hospital", "Biobank"):
+                invite_code = st.text_input(
+                    "Invite code",
+                    key="reg_invite_code",
+                    help="Required for Admin/Hospital/Biobank registration.",
+                    type="password",
+                )
+
+            if st.button("Register", use_container_width=True, key="register_btn"):
+                try:
+                    payload = {"username": r_username, "password": r_password, "role": r_role, "org": r_org}
+                    if r_role in ("Admin", "Hospital", "Biobank"):
+                        payload["invite_code"] = invite_code
+
+                    api_post("/auth/register", payload)
+                    st.success("Εγγραφή επιτυχής! Μπορείτε να συνδεθείτε.")
+                    log_run("auth.register", {"username": r_username, "role": r_role, "org": r_org})
+                except Exception as e:
+                    st.error(str(e))
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+        # Public portal
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        with st.expander("Patient Consent (Public Portal)", expanded=False):
+            st.info("Για ασθενείς: Καταχωρήστε την απόφασή σας για τη χρήση των δεδομένων σας στο Blockchain.")
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                patient_id = st.text_input("Patient Pseudonymous ID (e.g., PAT-0001)", key="pt_patient_id")
+                dataset_id = st.text_input("Dataset ID", key="pt_dataset_id", help="Paste the dataset_id you were given.")
+            with pc2:
+                decision = st.selectbox("Decision", ["allow", "deny"], key="pt_decision")
+                portal_secret = st.text_input(
+                    "Portal Secret",
+                    type="password",
+                    key="pt_secret",
+                    help="Set PATIENT_PORTAL_SECRET in backend env.",
+                )
+
+            if st.button("Submit Consent", key="pt_submit", type="primary", use_container_width=True):
+                try:
+                    payload = {
+                        "dataset_id": dataset_id,
+                        "patient_id": patient_id,
+                        "decision": decision,
+                        "secret": portal_secret,
+                    }
+                    resp = api_post("/public/consent", payload)
+                    st.success("Consent recorded on-chain")
+
+                    st.code(
+                        f"""
+                        event_type        : {resp.get('event_type')}
+                        ref_id            : {resp.get('ref_id')}
+                        tx_hash           : {resp.get('tx_hash')}
+                        chain_id          : {resp.get('chain_id')}
+                        contract_address  : {resp.get('contract_address')}
+                        payload_hash      : {resp.get('payload_hash')}
+                        """,
+
+                        language="text",
+                    )
+
+                except Exception as e:
+                    st.error(str(e))
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def ui_topbar() -> None:
     c1, c2, c3 = st.columns([3, 2, 1])
     with c1:
         st.markdown("[API Docs](http://localhost:8000/docs)")
@@ -492,37 +599,172 @@ def ui_topbar() -> None: # πάνω τμήμα της σελίδας όταν σ
 # Pages
 
 def page_dashboard() -> None:
-    st.header("Dashboard")
-    f1, f2, f3 = st.columns([1, 3, 1])
-    with f2:
-        s1, gap, s2 = st.columns([1, 0.25, 1])
-        with s1:
-            st.image(_assets_path("logo_1.png"), width=440)
-        with gap:
-            st.empty()
-        with s2:
-            st.image(_assets_path("logo_2.jpg"), width=440)
+    bg_image_url = "https://img.freepik.com/free-vector/abstract-medical-wallpaper-template-design_53876-61841.jpg"
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f"""
+        <style>
+        .stApp {{
+            background: linear-gradient(rgba(245, 247, 250, 0.92), rgba(245, 247, 250, 0.92)), 
+                        url("{bg_image_url}");
+            background-size: cover;
+            background-attachment: fixed;
+        }}
 
-    require_login()
-    flash_show()
+        .main-card {{
+            background: rgba(255, 255, 255, 0.8) !important;
+            backdrop-filter: blur(12px);
+            padding: 14px;               
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.5);
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
+            transition: all 0.3s ease;
 
-    try:
-        health = api_get("/health")  # Health check προς backend API
-        st.success(f"Backend status: {health.get('status', 'unknown')}")
-    except Exception as e:
-        st.error(str(e))
+            aspect-ratio: 1 / 1;        
+            min-height: 160px;       
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            gap: 8px;
+        }}
 
-    st.write(
-        """
-This platform supports federated-only descriptors:
-- Hospitals register dataset descriptors to local files hosted by their agents.
-- Biobanks and Researchers request access.
-- Hospitals approve/deny.
-- Approved parties can run federated jobs (no raw data transfer).
-        """
-    )
+        .main-card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 15px 35px rgba(59, 130, 246, 0.15);
+            border-color: #3b82f6;
+            background: rgba(255, 255, 255, 0.95) !important;
+        }}
+
+        .card-title {{
+            color: #1e3a8a;
+            font-size: 1.0rem;             
+            font-weight: 700;
+            margin-top: 6px;
+        }}
+
+
+        .card-text {{
+            color: #475569;
+            font-size: 0.78rem;       
+            line-height: 1.35;
+
+            display: -webkit-box;         
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }}
+
+        .hero-banner {{
+            background: linear-gradient(135deg, rgba(30, 58, 138, 0.9), rgba(37, 99, 235, 0.9));
+            backdrop-filter: blur(10px);
+            color: white;
+            padding: 10px 25px;
+            border-radius: 20px;
+            margin-bottom: 18px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }}
+
+        #Workflow Step 
+        .step-box {{
+            text-align: center;
+            background: rgba(255,255,255,0.5);
+            padding: 12px;
+            border-radius: 15px;
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            min-height: 100px;
+        }}
+        </style>
+    """, unsafe_allow_html=True)
+
+
+    st.markdown("""
+    <div class="hero-banner">
+        <div style='margin:0; font-size: 2.3rem; font-weight: 800;'>
+             Πλατφόρμα Συνεργατικής Ιατρικής Ανάλυσης
+        </div>
+        <p style='opacity: 0.9; font-size: 1.1rem; font-weight: 300; margin-top:10px;'>
+            στα πρότυπα του GDPR 
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    #  Work Flow
+    st.subheader("Work Flow")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+    with c1:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">🏥</span>
+                <div class="card-title">Nodes</div>
+                <div class="card-text">Διαχείριση και παρακολούθηση των τοπικών σταθμών εργασίας (Agents) στα νοσοκομεία.</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση σε Nodes", key="nav_nodes", use_container_width=True):
+            st.session_state.page = "Nodes"
+            st.rerun()
+
+    with c2:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">📂</span>
+                <div class="card-title">Datasets</div>
+                <div class="card-text">Ορισμός descriptors για τα ιατρικά δεδομένα. Τα δεδομένα παραμένουν τοπικά (GDPR).</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση σε Datasets", key="nav_data", use_container_width=True):
+            st.session_state.page = "Datasets"
+            st.rerun()
+
+    with c3:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">🔐</span>
+                <div class="card-title">Access Requests</div>
+                <div class="card-text">Διαχείριση αδειών. Εγκρίνετε ή απορρίψτε αιτήματα πρόσβασης σε αναλύσεις.</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση για αίτημα ή αποδοχή πρόσβασης", key="nav_ar", use_container_width=True):
+            st.session_state.page = "Access Requests"
+            st.rerun()
+
+    with c4:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">⏩️</span>
+                <div class="card-title">Federated Jobs</div>
+                <div class="card-text">Εκκίνηση Single ή Multi-party FL Jobs. Εκπαίδευση μοντέλων χωρίς μεταφορά δεδομένων.</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση σε Federated Jobs", key="nav_jobs", use_container_width=True):
+            st.session_state.page = "Federated Jobs"
+            st.rerun()
+
+    with c5:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">📜</span>
+                <div class="card-title">Smart Contracts</div>
+                <div class="card-text">Διαφανής καταγραφή κάθε ενέργειας στο Blockchain Ledger για πλήρη ιχνηλασιμότητα.</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση σε Smart Contracts", key="nav_sc", use_container_width=True):
+            st.session_state.page = "Smart Contract"
+            st.rerun()
+
+    with c6:
+        st.markdown("""<div class="main-card">
+            <div>
+                <span style="font-size: 1.8rem;">ℹ️</span>
+                <div class="card-title">History & Audits</div>
+                <div class="card-text">Ιστορικό εκτελέσεων, αποτελέσματα πειραμάτων και λήψη μετρικών απόδοσης.</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Μετάβαση στο ιστορικό ενεργειών", key="nav_history", use_container_width=True):
+            st.session_state.page = "History"
+            st.rerun()
 
 
 def page_nodes() -> None:
@@ -557,7 +799,6 @@ def page_datasets() -> None:
     if role_norm() == "Hospital":
         st.subheader("Create dataset descriptor")
         try:
-            # Παίρνουμε nodes ώστε ο Hospital να διαλέξει πού θα ανεβάσει το αρχείο
             nodes = api_get("/nodes")
         except Exception as e:
             st.error(str(e))
@@ -613,7 +854,7 @@ def page_datasets() -> None:
             local_uri = st.session_state.get("uploaded_local_uri", "")
             st.text_input("Local URI (inside agent container)", value=local_uri, disabled=True, key="ds_local_uri")
 
-            # Create descriptor στο backend
+            # Create descriptor
             if st.button("Create descriptor", type="primary", key="ds_create_btn"):
                 try:
                     if not local_uri:
@@ -649,7 +890,7 @@ def page_datasets() -> None:
         st.divider()
 
 
-    # List datasets (όλοι οι ρόλοι)
+    # List datasets
 
     st.subheader("List datasets")
     try:
@@ -794,7 +1035,6 @@ def page_access_requests() -> None:
     st.header("Access Requests")
     require_login()
     flash_show()
-
 
     # Submit access request
     if role_norm() in ("Researcher", "Biobank"):
@@ -1082,7 +1322,6 @@ def page_federated_jobs() -> None:
     st.divider()
     st.subheader("Run job")
 
-    st.subheader("Display options")
     sections = st.multiselect(
         "Select which analytics sections to display",
         options=[
@@ -1125,7 +1364,7 @@ def page_federated_jobs() -> None:
             metrics["_ui_response_size_kb"] = _json_size_kb(job)
             metrics["_ui_metrics_size_kb"] = _json_size_kb(metrics)
 
-            # Execution / Telemetry
+            # Telemetry
             if "Telemetry" in sections:
                 st.subheader("Telemetry")
 
@@ -1156,13 +1395,6 @@ def page_federated_jobs() -> None:
                     st.caption("Per-round metrics")
                     st.dataframe(rounds_df, use_container_width=True)
 
-            """
-            if "Raw JSON (debug)" in sections:
-                with st.expander("Raw job JSON"):
-                    st.json(job)
-                with st.expander("Raw metrics JSON"):
-                    st.json(metrics)
-             """
 
             # Log run
             log_run(
@@ -1340,7 +1572,6 @@ def page_federated_jobs() -> None:
             ja = job_map.get(a_label) or {}
             ja_full = api_get(f"/fl/jobs/{ja.get('job_id')}")
 
-            # Call backend baseline
             base = api_post(f"/fl/jobs/{ja.get('job_id')}/baseline", payload={})
 
             if not base or not isinstance(base, dict):
@@ -1365,7 +1596,7 @@ def page_federated_jobs() -> None:
 
             ma = (ja_full.get("metrics") or {})
 
-            st.caption("Baseline computed centrally (for benchmarking).")
+            st.caption("Baseline computed centrally")
             st.json({
                 "baseline_total_rows": baseline.get("total_rows"),
                 "baseline_datasets": base.get("dataset_ids"),
@@ -1373,7 +1604,6 @@ def page_federated_jobs() -> None:
 
             st.divider()
             st.subheader("Comparison Results")
-            st.caption("Mode: FL vs centralized baseline (no FL/BC)")
 
             st.caption("FL telemetry (A)")
             st.dataframe(pd.DataFrame([{
@@ -1383,7 +1613,6 @@ def page_federated_jobs() -> None:
                 "avg_round_payload_kb": ma.get("avg_round_payload_kb"),
                 "last_round_row_count": ma.get("last_round_row_count"),
             }]), use_container_width=True)
-            st.info("Telemetry metrics are not available for centralized baseline.")
 
             # Feature metrics comparison
             fm_cmp = _compare_feature_metrics(ma, mb)
@@ -1424,21 +1653,6 @@ def page_federated_jobs() -> None:
             st.caption("Normalized Feature (Top-K overlap)")
             st.json(ni_summary)
 
-            # Privacy/Governance compare
-            st.caption("Privacy Governance (A vs B)")
-            st.dataframe(pd.DataFrame([{
-                "A_suppressed": (ma.get("privacy") or {}).get("suppressed"),
-                "B_suppressed": (mb.get("privacy") or {}).get("suppressed"),
-                "A_min_row_threshold": (ma.get("privacy") or {}).get("min_row_threshold"),
-                "B_min_row_threshold": (mb.get("privacy") or {}).get("min_row_threshold"),
-            }]), use_container_width=True)
-
-            st.caption("Side-by-side summary")
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("A participants", ma.get("participants_count"))
-            s2.metric("B participants", mb.get("participants_count"))
-            s3.metric("A total sec", ma.get("job_total_duration_sec"))
-            s4.metric("B total sec", mb.get("job_total_duration_sec"))
 
         else:
             st.info("No FL jobs found to compare yet.")
@@ -1448,11 +1662,10 @@ def page_federated_jobs() -> None:
 
 
 def page_runs_history() -> None:
-    st.header("Runs / History")
+    st.header("History")
     require_login()
     flash_show()
 
-    st.caption("Keeps a record of actions run by the current user. Includes a download option per entry.")
     try:
         role = role_norm()
 
@@ -1585,7 +1798,7 @@ def page_smart_contract() -> None:
 
     # Filters
     st.subheader("Filters")
-    ev_types = sorted([x for x in df["event_type"].dropna().unique().tolist()])
+    ev_types = sorted([x for x in df["event_type"].dropna().unique().tolist() if x != "DEBUG_ANCHOR"])
     pick = st.multiselect("event_type", options=ev_types, default=ev_types)
 
     fdf = df[df["event_type"].isin(pick)].copy()
@@ -1598,7 +1811,7 @@ def page_smart_contract() -> None:
 
     - **event_type**  
       Τύπος ενέργειας (π.χ. έλεγχος συγκατάθεσης, δημιουργία federated job).  
-      ➜ Περιγράφει *ποια λειτουργία* αποτυπώνεται.
+      ➜ Περιγράφει την λειτουργία που αποτυπώνεται.
 
     - **ref_id**  
       Αναγνωριστικό της οντότητας που αφορά το γεγονός (π.χ. job_id, request_id, ή dataset_id:patient_key).  
@@ -1644,7 +1857,7 @@ def page_smart_contract() -> None:
       ➜ Δείκτης απόδοσης του δικτύου και της εμπειρίας χρήστη στο BC-FL.
     """)
 
-    st.subheader("Receipts (filtered)")
+    st.subheader("Receipts")
     st.dataframe(fdf, use_container_width=True)
 
     st.download_button(
@@ -1658,20 +1871,6 @@ def page_smart_contract() -> None:
         if col in fdf.columns:
             fdf[col] = pd.to_numeric(fdf[col], errors="coerce")
 
-    """
-    st.subheader("Stats")
-
-    stats_row = {
-        "receipts_count": int(len(fdf)),
-        "unique_event_types": int(fdf["event_type"].nunique()) if "event_type" in fdf.columns else 0,
-        "modes": str(fdf["mode"].dropna().unique().tolist()[:3]) if "mode" in fdf.columns else "N/A",
-    }
-    
-    
-    stats_row["blockchain_time_span_sec"] = int(ts.max() - ts.min()) if ts.size >= 2 else None
-    st.dataframe(pd.DataFrame([stats_row]), use_container_width=True)
-    
-    """
 
     #  Execution Overview
     st.subheader("Execution Overview")
@@ -1687,7 +1886,7 @@ def page_smart_contract() -> None:
     else:
         col3.metric("Blockchain Time Span (sec)", "—")
 
-    #  Smart Contract Evaluation
+    #  Smart Contract
     st.subheader("Smart Contract Evaluation")
 
     gas = fdf["gas_used"].dropna() if "gas_used" in fdf.columns else pd.Series([], dtype=float)
@@ -1704,7 +1903,6 @@ def page_smart_contract() -> None:
     }
     st.dataframe(pd.DataFrame([summary_row]), use_container_width=True)
 
-    # Per event_type table
     if "event_type" in fdf.columns:
         per_type = (
             fdf.groupby("event_type", dropna=False)
@@ -1721,97 +1919,13 @@ def page_smart_contract() -> None:
         st.caption("Per event_type")
         st.dataframe(per_type, use_container_width=True)
 
-    """
-    Plot
-    st.write("Event types in filtered df:", fdf["event_type"].value_counts())
-    st.subheader("Gas Used Distribution by event type")
-
-    plot_df = fdf.dropna(subset=["event_type", "gas_used"]).copy()
-    if plot_df.empty:
-        st.info("No gas_used values available yet.")
-        return
-
-    types = plot_df["event_type"].astype(str).unique().tolist()
-    data = [plot_df.loc[plot_df["event_type"].astype(str) == t, "gas_used"].values for t in types]
-
-    plot_df = fdf.dropna(subset=["event_type", "gas_used"]).copy()
-    if plot_df.empty:
-        st.info("No gas_used values available yet.")
-        return
-
-    wanted_order = ["RUN_RECORDED", "PATIENT_CONSENT_TX", "PATIENT_CONSENT_UPDATED"]
-    types_present = [t for t in wanted_order if t in plot_df["event_type"].astype(str).unique().tolist()]
-    others = [t for t in plot_df["event_type"].astype(str).unique().tolist() if t not in types_present]
-    types = types_present + others
-
-    data = [plot_df.loc[plot_df["event_type"].astype(str) == t, "gas_used"].values for t in types]
-
-    fig, ax = plt.subplots(figsize=(3.2, 2.4), dpi=150)
-    ax.boxplot(data, labels=types, showfliers=False)
-    ax.set_title("Gas per event_type", loc="left", fontsize=9)
-    ax.set_ylabel("gas_used (units)", fontsize=8)
-    ax.tick_params(axis="x", labelsize=7, rotation=30)
-    ax.tick_params(axis="y", labelsize=8)
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
-    """
-    """
-    plot 2
-    st.subheader("Gas / Latency")
-
-    time_df = fdf.copy()
-
-    time_df["ts_utc"] = pd.to_datetime(time_df.get("block_timestamp"), unit="s", utc=True, errors="coerce")
-    mask = time_df["ts_utc"].isna()
-    time_df.loc[mask, "ts_utc"] = pd.to_datetime(time_df.loc[mask, "created_at"], utc=True, errors="coerce")
-
-    time_df = time_df.dropna(subset=["ts_utc"])
-    time_df["ts_local"] = time_df["ts_utc"].dt.tz_convert("Europe/Athens")
-
-    metric_choice = st.selectbox("Metric", ["gas_used", "latency_ms"], index=0, key="sc_time_metric")
-
-    plot_t = time_df.dropna(subset=[metric_choice, "event_type"]).copy()
-    if plot_t.empty:
-        st.info("No time-series values available yet for this metric.")
-    else:
-        fig, ax = plt.subplots(figsize=(3.6, 2.4), dpi=150)
-
-        series_types = st.multiselect(
-            "Event types to plot",
-            options=sorted(plot_t["event_type"].astype(str).unique().tolist()),
-            default=sorted(plot_t["event_type"].astype(str).unique().tolist()),
-            key="sc_plot_types",
-        )
-
-        for et in series_types:
-            sub = plot_t[plot_t["event_type"].astype(str) == et]
-            if sub.empty:
-                continue
-            ax.scatter(sub["ts_local"], sub[metric_choice], s=10, label=et)
-
-        ax.set_title(f"{metric_choice} over time", loc="left", fontsize=9)
-        ax.set_ylabel(metric_choice, fontsize=8)
-
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %H:%M"))
-        ax.tick_params(axis="x", labelsize=7, rotation=30)
-        ax.tick_params(axis="y", labelsize=8)
-
-        ax.legend(fontsize=6)
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=False)
-     """
 
 def page_settings() -> None:
-    st.header("Settings")
+
     require_login()
     flash_show()
 
-    st.subheader("Backend URL")
-    st.code(DEFAULT_BASE_URL)
-    st.caption("To change it, set API_BASE_URL env var for the UI container.")
-
-    st.subheader("Session")
+    st.header("Settings")
     st.json(
         {
             "username": st.session_state.get("username"),
@@ -1821,11 +1935,78 @@ def page_settings() -> None:
         }
     )
 
-
 def main() -> None:
-
     st.set_page_config(page_title="BC-FL Platform", layout="wide")
 
+    st.markdown("""
+    <style>
+    section[data-testid="stSidebar"] {
+        background: rgba(255,255,255,0.75);
+        backdrop-filter: blur(10px);
+        border-right: 1px solid rgba(15, 23, 42, 0.06);
+    }
+
+    .sidebar-title {
+        font-size: 1.05rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin: 0 0 0.35rem 0;
+    }
+
+    .sidebar-subtitle {
+        color: #475569;
+        font-size: 0.85rem;
+        margin-bottom: 8px;
+    }
+
+    .sidebar-meta {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 8px;
+        margin-bottom: 10px;
+    }
+    .sidebar-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(59,130,246,0.18);
+        background: rgba(59,130,246,0.06);
+        color: #1e3a8a;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+
+    section[data-testid="stSidebar"] label {
+        font-weight: 700 !important;
+        color: #0f172a !important;
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+        border-radius: 12px;
+        padding: 8px 10px;
+        margin: 4px 0;
+        border: 1px solid rgba(15, 23, 42, 0.06);
+        background: rgba(255,255,255,0.65);
+        transition: all 0.18s ease;
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+        border-color: rgba(59,130,246,0.25);
+        background: rgba(255,255,255,0.92);
+        transform: translateX(2px);
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] input[aria-checked="true"] + div {
+        font-weight: 800 !important;
+        color: #1e3a8a !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Sidebar navigation
     ui_topbar()
 
     if not st.session_state.get("token"):
@@ -1834,32 +2015,69 @@ def main() -> None:
 
     pages = PAGES_BY_ROLE.get(role_norm(), ["Dashboard", "Settings"])
 
-    # Sidebar navigation
-    with st.sidebar:
-        st.title("Navigation")
-        page = st.radio("Go to", pages, index=0)
+    if "page" not in st.session_state:
+        st.session_state.page = "Dashboard"
 
-    # Routing: ανάλογα με την επιλογή, καλούμε την αντίστοιχη συνάρτηση σελίδας
-    if page == "Dashboard":
+    PAGE_ICONS = {
+        "Dashboard": " ",
+        "Nodes": "🏥",
+        "Datasets": "📂",
+        "Consents": "📝",
+        "Access Requests": "🔐",
+        "Federated Jobs": "⏩️",
+        "Smart Contract": "📜",
+        "History": "ℹ️",
+        "Settings": "⚙️",
+    }
+
+
+    with st.sidebar:
+        st.markdown(
+            f"""
+            <div class="sidebar-title">Navigation</div>
+            <div class="sidebar-subtitle">Επιλέξτε σελίδα για πλοήγηση</div>
+
+            <div class="sidebar-meta">
+                <span class="sidebar-chip">Role: {role_norm()}</span>
+                <span class="sidebar-chip">Org: {org()}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        try:
+            current_index = pages.index(st.session_state.page)
+        except ValueError:
+            current_index = 0
+
+        labels = [f"{PAGE_ICONS.get(p,'•')}  {p}" for p in pages]
+        label_to_page = {labels[i]: pages[i] for i in range(len(pages))}
+
+        picked_label = st.radio("Go to", labels, index=current_index)
+        st.session_state.page = label_to_page[picked_label]
+
+        st.caption("BC-FL Platform • UI Navigation")
+
+    if st.session_state.page == "Dashboard":
         page_dashboard()
-    elif page == "Nodes":
+    elif st.session_state.page == "Nodes":
         page_nodes()
-    elif page == "Datasets":
+    elif st.session_state.page == "Datasets":
         page_datasets()
-    elif page == "Consents":
+    elif st.session_state.page == "Consents":
         page_consents()
-    elif page == "Access Requests":
+    elif st.session_state.page == "Access Requests":
         page_access_requests()
-    elif page == "Federated Jobs":
+    elif st.session_state.page == "Federated Jobs":
         page_federated_jobs()
-    elif page == "Runs / History":
-        page_runs_history()
-    elif page == "Smart Contract":
+    elif st.session_state.page == "Smart Contract":
         page_smart_contract()
-    elif page == "Settings":
+    elif st.session_state.page == "History":
+        page_runs_history()
+    elif st.session_state.page == "Settings":
         page_settings()
     else:
-        st.write("Unknown page.")
+        st.info("Page not implemented yet.")
 
 
 if __name__ == "__main__":
