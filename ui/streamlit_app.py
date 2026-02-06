@@ -167,6 +167,96 @@ def _dataset_exposed_features(ds: Dict[str, Any]) -> List[str]:
         return []
     return [str(x) for x in (feats or []) if str(x).strip()]
 
+def _safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _rel_err(a, b, eps=1e-12):
+    fa = _safe_float(a)
+    fb = _safe_float(b)
+    if fa is None or fb is None:
+        return None
+    return abs(fa - fb) / (abs(fb) + eps)
+
+def _compare_feature_metrics(ma: dict, mb: dict) -> pd.DataFrame:
+    fa = (ma.get("feature_metrics") or ma.get("feature_stats") or {}) if isinstance(ma, dict) else {}
+    fb = (mb.get("feature_metrics") or mb.get("feature_stats") or {}) if isinstance(mb, dict) else {}
+
+    feats = sorted(set(fa.keys()) | set(fb.keys()))
+    rows = []
+    for f in feats:
+        a = fa.get(f) or {}
+        b = fb.get(f) or {}
+        if not isinstance(a, dict): a = {}
+        if not isinstance(b, dict): b = {}
+
+        for key in ["mean", "std", "min", "max", "missing_rate", "variance"]:
+            va = a.get(key)
+            vb = b.get(key)
+            rows.append({
+                "feature": f,
+                "metric": key,
+                "A": _safe_float(va),
+                "B": _safe_float(vb),
+                "abs_diff": None if (_safe_float(va) is None or _safe_float(vb) is None) else abs(float(va) - float(vb)),
+                "rel_error": _rel_err(va, vb) if key in ("mean","std","variance") else None,
+            })
+    df = pd.DataFrame(rows)
+    return df
+
+def _compare_corr(ma: dict, mb: dict) -> dict:
+    ca = ma.get("correlation_matrix") if isinstance(ma, dict) else None
+    cb = mb.get("correlation_matrix") if isinstance(mb, dict) else None
+    if not isinstance(ca, dict) or not isinstance(cb, dict) or not ca or not cb:
+        return {"ok": False, "reason": "missing correlation_matrix"}
+
+    da = pd.DataFrame(ca).apply(pd.to_numeric, errors="coerce")
+    db = pd.DataFrame(cb).apply(pd.to_numeric, errors="coerce")
+
+    common = sorted(set(da.columns) & set(db.columns))
+    if not common:
+        return {"ok": False, "reason": "no common correlation features"}
+
+    da = da.reindex(index=common, columns=common)
+    db = db.reindex(index=common, columns=common)
+
+    diff = (da - db).abs()
+    mad = float(diff.stack().mean(skipna=True))
+    mx = float(diff.stack().max(skipna=True))
+    fro = float(np.sqrt(np.nansum((da.values - db.values) ** 2)))
+
+    return {
+        "ok": True,
+        "common_features": len(common),
+        "corr_mad": round(mad, 6),
+        "corr_max_abs": round(mx, 6),
+        "corr_fro_norm": round(fro, 6),
+    }
+
+def _topk_overlap(da: dict, db: dict, k: int = 10) -> dict:
+    if not isinstance(da, dict) or not isinstance(db, dict) or not da or not db:
+        return {"ok": False, "reason": "missing normalized_importance"}
+
+    sa = pd.Series(da).apply(pd.to_numeric, errors="coerce").dropna().sort_values(ascending=False)
+    sb = pd.Series(db).apply(pd.to_numeric, errors="coerce").dropna().sort_values(ascending=False)
+
+    topa = list(sa.head(k).index.astype(str))
+    topb = list(sb.head(k).index.astype(str))
+    inter = set(topa) & set(topb)
+    union = set(topa) | set(topb)
+    jacc = (len(inter) / len(union)) if union else None
+
+    return {
+        "ok": True,
+        "k": int(k),
+        "topk_overlap": int(len(inter)),
+        "topk_jaccard": None if jacc is None else round(float(jacc), 4),
+        "topA": topa,
+        "topB": topb,
+    }
+
 
 def _features_available_to_requester(ds: Dict[str, Any]) -> List[str]:
     """
@@ -184,7 +274,7 @@ def _features_available_to_requester(ds: Dict[str, Any]) -> List[str]:
 def suggest_actions(metrics: dict) -> list[str]:
     actions: list[str] = []
 
-    # 1) Data quality
+    # Data quality
     feature_stats = (metrics.get("feature_metrics") or metrics.get("feature_stats") or {})
     if isinstance(feature_stats, dict) and feature_stats:
         for feat, s in feature_stats.items():
@@ -201,7 +291,7 @@ def suggest_actions(metrics: dict) -> list[str]:
             if s.get("is_constant") is True:
                 actions.append(f"[Data Quality] '{feat}' φαίνεται constant/zero: πρότεινε αφαίρεση feature.")
 
-    # 2) Privacy / governance
+    # Privacy / governance
     privacy = metrics.get("privacy") or {}
     if isinstance(privacy, dict) and privacy:
         thr = privacy.get("min_row_threshold")
@@ -216,7 +306,7 @@ def suggest_actions(metrics: dict) -> list[str]:
         if thr is not None:
             actions.append(f"[Privacy] Ελάχιστο threshold={thr}. Πρότεινε rule: μην εμφανίζεις stats για N<threshold.")
 
-    # 3) Rounds μελλοντικά με ml
+    # Rounds μελλοντικά με ml
     trends = metrics.get("round_trends") or {}
     if isinstance(trends, dict) and trends:
         actions.append("[Trends] Υπάρχουν round_trends: δείξε convergence plot ή μείωσε rounds αν συγκλίνει γρήγορα.")
@@ -931,7 +1021,6 @@ def page_federated_jobs() -> None:
 
     if st.button("Create FL Job", type="primary"):  # Κουμπί δημιουργίας job
         try:
-            # Approval check for ALL selected datasets (show name | owner | uuid)
             missing = []
             for did in (dataset_ids or []):
                 if not _is_request_approved_for_user(did):
@@ -968,7 +1057,7 @@ def page_federated_jobs() -> None:
                 "notes": notes,
             }
 
-            job = api_post("/fl/jobs", payload)  # Δημιουργία job στο backend (επιστρέφει FLJob record)
+            job = api_post("/fl/jobs", payload)
 
             st.success(f"Job created: {job.get('job_id')}")
 
@@ -1004,7 +1093,7 @@ def page_federated_jobs() -> None:
             "Normalized Importance",
             "Round Trends",
             "Correlation Matrix",
-            "Raw JSON (debug)",
+            #"Raw JSON (debug)",
         ],
         key="fl_display_sections",
     )
@@ -1036,7 +1125,7 @@ def page_federated_jobs() -> None:
             metrics["_ui_response_size_kb"] = _json_size_kb(job)
             metrics["_ui_metrics_size_kb"] = _json_size_kb(metrics)
 
-            # Execution / Telemetry (tables)
+            # Execution / Telemetry
             if "Execution / Telemetry" in sections:
                 st.subheader("Execution / Telemetry")
 
@@ -1067,11 +1156,13 @@ def page_federated_jobs() -> None:
                     st.caption("Per-round metrics")
                     st.dataframe(rounds_df, use_container_width=True)
 
+            """
             if "Raw JSON (debug)" in sections:
                 with st.expander("Raw job JSON"):
                     st.json(job)
                 with st.expander("Raw metrics JSON"):
                     st.json(metrics)
+             """
 
             # Log run
             log_run(
@@ -1112,13 +1203,13 @@ def page_federated_jobs() -> None:
                 col2.metric("Response size (KB)", metrics.get("_ui_response_size_kb"))
                 col3.metric("Metrics size (KB)", metrics.get("_ui_metrics_size_kb"))
 
-            # 1) Privacy / Governance
+            # Privacy / Governance
             privacy = metrics.get("privacy") or {}
             if "Privacy / Governance" in sections and privacy:
                 st.subheader("Privacy / Governance")
                 st.json(privacy)
 
-            # 2) Feature metrics
+            # Feature metrics
             feature_metrics = metrics.get("feature_metrics") or metrics.get("feature_stats") or {}
             if "Feature Metrics (Distribution & Data Quality)" in sections and feature_metrics:
                 st.subheader("Feature Metrics (Distribution & Data Quality)")
@@ -1140,13 +1231,13 @@ def page_federated_jobs() -> None:
                 except Exception:
                     st.json(feature_metrics)
 
-            # 3) Normalized importance
+            # Normalized importance
             norm_imp = metrics.get("normalized_importance")
             if "Normalized Importance" in sections and norm_imp:
                 st.subheader("Normalized Feature Importance")
                 st.json(norm_imp)
 
-            # 4) Round trends
+            # Round trends
             round_trends = metrics.get("round_trends")
             if "Round Trends" in sections and round_trends:
                 st.subheader("Round Trends")
@@ -1159,7 +1250,7 @@ def page_federated_jobs() -> None:
                         file_name=f"round_trends_{job_id.strip()}.csv",
                         mime="text/csv",
                     )
-            # 5) Correlation matrix
+            # Correlation matrix
             corr = metrics.get("correlation_matrix")
 
             if "Correlation Matrix" in sections:
@@ -1184,7 +1275,7 @@ def page_federated_jobs() -> None:
 
                             fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-                            norm = TwoSlopeNorm(vmin=-0.1, vcenter=0.0, vmax=0.1)
+                            norm = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
 
                             im = ax.imshow(
                                 corr_df.values,
@@ -1193,6 +1284,10 @@ def page_federated_jobs() -> None:
                                 aspect="equal",
                                 interpolation="nearest",
                             )
+
+                            cbar = fig.colorbar(im, ax=ax, fraction=0.038, pad=0.02)
+                            cbar.ax.tick_params(labelsize=6)
+                            cbar.set_ticks([-1, -0.5, 0, 0.5, 1])
 
                             ax.set_xticks(np.arange(n))
                             ax.set_yticks(np.arange(n))
@@ -1206,9 +1301,6 @@ def page_federated_jobs() -> None:
                                     txt_color = "white" if abs(vv) >= 0.06 else "black"
                                     ax.text(j, i, f"{vv:.2f}", ha="center", va="center", fontsize=6, color=txt_color)
 
-                            cbar = fig.colorbar(im, ax=ax, fraction=0.038, pad=0.02)
-                            cbar.ax.tick_params(labelsize=6)
-                            cbar.set_ticks([-0.1, -0.05, 0, 0.05, 0.1])
 
                             ax.set_title("Pearson correlation heatmap", fontsize=8, loc="left", pad=6)
 
@@ -1224,9 +1316,10 @@ def page_federated_jobs() -> None:
 
     # Admin: Compare FL Jobs
     st.divider()
-    st.subheader("Admin: Compare FL Jobs")
+    st.subheader("FL vs Baseline \n (only admin - for test cases hospital)")
 
-    if role_norm() == "Admin":
+    if role_norm() in ("Admin", "Hospital"):
+
         try:
             jobs = api_get("/fl/jobs", params={"limit": 200})
         except Exception as e:
@@ -1236,31 +1329,109 @@ def page_federated_jobs() -> None:
         if jobs:
             def job_label(j: dict) -> str:
                 return (
-                    f"{j.get('created_at','')} | {j.get('status','')} | "
+                    f"{j.get('created_at', '')} | {j.get('status', '')} | "
                     f"{j.get('job_id')} | scope={j.get('scope')} | rounds={j.get('rounds')} | "
                     f"by={j.get('created_by')} ({j.get('created_by_org')})"
                 )
 
             job_map = {job_label(j): j for j in jobs}
 
-            c1, c2 = st.columns(2)
-            with c1:
-                a_label = st.selectbox("Job A", list(job_map.keys()), key="cmp_job_a")
-            with c2:
-                b_label = st.selectbox("Job B", list(job_map.keys()), key="cmp_job_b")
-
+            a_label = st.selectbox("Job (FL)", list(job_map.keys()), key="cmp_job_a")
             ja = job_map.get(a_label) or {}
-            jb = job_map.get(b_label) or {}
+            ja_full = api_get(f"/fl/jobs/{ja.get('job_id')}")
 
-            try:
-                ja_full = api_get(f"/fl/jobs/{ja.get('job_id')}")
-                jb_full = api_get(f"/fl/jobs/{jb.get('job_id')}")
-            except Exception as e:
-                st.error(str(e))
-                ja_full, jb_full = ja, jb
+            # Call backend baseline
+            base = api_post(f"/fl/jobs/{ja.get('job_id')}/baseline", payload={})
+
+            if not base or not isinstance(base, dict):
+                st.error("Baseline endpoint returned empty response.")
+                st.stop()
+
+            if base.get("ok") is False:
+                st.error(base.get("error") or "Baseline failed")
+                st.stop()
+
+            baseline = (base or {}).get("baseline") or {}
+            if not isinstance(baseline, dict) or not baseline:
+                st.error("Baseline response missing 'baseline' payload.")
+                st.stop()
+
+            mb = {
+                "feature_metrics": baseline.get("feature_metrics") or {},
+                "normalized_importance": baseline.get("normalized_importance") or {},
+                "correlation_matrix": baseline.get("correlation_matrix") or {},
+                "privacy": {"suppressed": False, "min_row_threshold": None},
+            }
 
             ma = (ja_full.get("metrics") or {})
-            mb = (jb_full.get("metrics") or {})
+
+            st.caption("Baseline computed centrally (for benchmarking).")
+            st.json({
+                "baseline_total_rows": baseline.get("total_rows"),
+                "baseline_datasets": base.get("dataset_ids"),
+            })
+
+            st.divider()
+            st.subheader("Comparison Results")
+            st.caption("Mode: FL vs centralized baseline (no FL/BC)")
+
+            st.caption("FL telemetry (A)")
+            st.dataframe(pd.DataFrame([{
+                "participants_count": ma.get("participants_count"),
+                "job_total_duration_sec": ma.get("job_total_duration_sec"),
+                "avg_round_duration_sec": ma.get("avg_round_duration_sec"),
+                "avg_round_payload_kb": ma.get("avg_round_payload_kb"),
+                "last_round_row_count": ma.get("last_round_row_count"),
+            }]), use_container_width=True)
+            st.info("Telemetry metrics are not available for centralized baseline.")
+
+            # Feature metrics comparison
+            fm_cmp = _compare_feature_metrics(ma, mb)
+            if fm_cmp.empty:
+                st.info("No feature_metrics available to compare.")
+            else:
+                st.caption("Compare Feature Metrics")
+                st.dataframe(fm_cmp, use_container_width=True)
+                st.download_button(
+                    "Download feature comparison (CSV)",
+                    data=fm_cmp.to_csv(index=False).encode("utf-8"),
+                    file_name="feature_metrics_compare_A_vs_B.csv",
+                    mime="text/csv",
+                )
+
+                mean_rel = fm_cmp[(fm_cmp["metric"] == "mean") & (fm_cmp["rel_error"].notna())]["rel_error"]
+                miss_abs = fm_cmp[(fm_cmp["metric"] == "missing_rate") & (fm_cmp["abs_diff"].notna())]["abs_diff"]
+
+                agreement = {
+                    "mean_rel_error_avg": None if mean_rel.empty else float(mean_rel.mean()),
+                    "mean_rel_error_max": None if mean_rel.empty else float(mean_rel.max()),
+                    "missing_rate_abs_diff_avg": None if miss_abs.empty else float(miss_abs.mean()),
+                    "features_compared": int(fm_cmp["feature"].nunique()) if "feature" in fm_cmp.columns else 0,
+                }
+                st.caption("Overall Agreement Score (derived)")
+                st.dataframe(pd.DataFrame([agreement]), use_container_width=True)
+
+            # Correlation compare
+            corr_summary = _compare_corr(ma, mb)
+            st.caption("Correlation Matrix Agreement")
+            st.json(corr_summary)
+
+            # Normalized importance compare
+            ni_a = ma.get("normalized_importance") or {}
+            ni_b = mb.get("normalized_importance") or {}
+            k = st.slider("Top-K for importance overlap", min_value=5, max_value=30, value=10, step=1, key="cmp_topk")
+            ni_summary = _topk_overlap(ni_a, ni_b, k=k)
+            st.caption("Normalized Importance (Top-K overlap)")
+            st.json(ni_summary)
+
+            # Privacy/Governance compare
+            st.caption("Privacy / Governance (A vs B)")
+            st.dataframe(pd.DataFrame([{
+                "A_suppressed": (ma.get("privacy") or {}).get("suppressed"),
+                "B_suppressed": (mb.get("privacy") or {}).get("suppressed"),
+                "A_min_row_threshold": (ma.get("privacy") or {}).get("min_row_threshold"),
+                "B_min_row_threshold": (mb.get("privacy") or {}).get("min_row_threshold"),
+            }]), use_container_width=True)
 
             st.caption("Side-by-side summary")
             s1, s2, s3, s4 = st.columns(4)
@@ -1269,62 +1440,12 @@ def page_federated_jobs() -> None:
             s3.metric("A total sec", ma.get("job_total_duration_sec"))
             s4.metric("B total sec", mb.get("job_total_duration_sec"))
 
-            st.write("**Scope**:", ja_full.get("scope"), "vs", jb_full.get("scope"))
-            st.write(
-                "**Datasets**:",
-                ja_full.get("dataset_ids") or [ja_full.get("dataset_id")],
-                "vs",
-                jb_full.get("dataset_ids") or [jb_full.get("dataset_id")],
-            )
-            st.write(
-                "**Features count**:",
-                len(ja_full.get("features") or []),
-                "vs",
-                len(jb_full.get("features") or []),
-            )
-
-            ga = ja_full.get("global_model") or {}
-            gb = jb_full.get("global_model") or {}
-
-            common = sorted(set(ga.keys()) & set(gb.keys()))
-            only_a = sorted(set(ga.keys()) - set(gb.keys()))
-            only_b = sorted(set(gb.keys()) - set(ga.keys()))
-
-            st.subheader("Global Aggregates Comparison")
-            st.write(f"Common features: {len(common)} | Only A: {len(only_a)} | Only B: {len(only_b)}")
-
-            if common:
-                rows = []
-                for k in common:
-                    va = float(ga.get(k, 0.0))
-                    vb = float(gb.get(k, 0.0))
-                    rows.append({"feature": k, "A": va, "B": vb, "diff(B-A)": vb - va})
-                df_cmp = pd.DataFrame(rows).sort_values("diff(B-A)", ascending=False)
-                st.dataframe(df_cmp, use_container_width=True)
-                st.download_button(
-                    "Download comparison (CSV)",
-                    data=df_cmp.to_csv(index=False).encode("utf-8"),
-                    file_name="fl_job_comparison.csv",
-                    mime="text/csv",
-                )
-
-            if only_a:
-                st.info("Only in A (missing in B): " + ", ".join(only_a[:30]) + (" ..." if len(only_a) > 30 else ""))
-            if only_b:
-                st.info("Only in B (missing in A): " + ", ".join(only_b[:30]) + (" ..." if len(only_b) > 30 else ""))
-
-            ta = ma.get("round_trends") or {}
-            tb = mb.get("round_trends") or {}
-            if isinstance(ta, dict) and isinstance(tb, dict) and ta and tb:
-                st.subheader("Round Trends (Common)")
-                common_tr = sorted(set(ta.keys()) & set(tb.keys()))
-                pick_tr = st.selectbox("Pick trend series", options=common_tr, key="cmp_trend_pick") if common_tr else None
-                if pick_tr:
-                    st.line_chart(pd.DataFrame({"A": ta.get(pick_tr, []), "B": tb.get(pick_tr, [])}))
         else:
             st.info("No FL jobs found to compare yet.")
+
     else:
         st.caption("Comparison is available to Admin only.")
+
 
 def page_runs_history() -> None:
     st.header("Runs / History")
@@ -1350,7 +1471,6 @@ def page_runs_history() -> None:
         st.info("No runs saved yet.")
         return
 
-    # Εμφανίζουμε runs με πιο πρόσφατο expanded (idx == 0)
     for idx, r in enumerate(runs):
         rid = r.get("run_id")
         created_at = r.get("created_at")
@@ -1360,7 +1480,6 @@ def page_runs_history() -> None:
         with st.expander(f"{created_at} | {run_type} | {rid}", expanded=(idx == 0)):
             st.json(payload)
 
-            # Download button: εξαγωγή του run ως JSON αρχείο
             st.download_button(
                 "Download JSON",
                 data=json.dumps(
@@ -1539,6 +1658,7 @@ def page_smart_contract() -> None:
         if col in fdf.columns:
             fdf[col] = pd.to_numeric(fdf[col], errors="coerce")
 
+    """
     st.subheader("Stats")
 
     stats_row = {
@@ -1546,11 +1666,12 @@ def page_smart_contract() -> None:
         "unique_event_types": int(fdf["event_type"].nunique()) if "event_type" in fdf.columns else 0,
         "modes": str(fdf["mode"].dropna().unique().tolist()[:3]) if "mode" in fdf.columns else "N/A",
     }
-
-    ts = fdf["block_timestamp"].dropna() if "block_timestamp" in fdf.columns else pd.Series([], dtype=float)
+    
+    
     stats_row["blockchain_time_span_sec"] = int(ts.max() - ts.min()) if ts.size >= 2 else None
-
     st.dataframe(pd.DataFrame([stats_row]), use_container_width=True)
+    
+    """
 
     #  Execution Overview
     st.subheader("Execution Overview")
@@ -1560,6 +1681,7 @@ def page_smart_contract() -> None:
     col1.metric("Total On-chain Events", onchain_count)
     col2.metric("Distinct Event Types", int(fdf["event_type"].nunique()) if "event_type" in fdf.columns else 0)
 
+    ts = fdf["block_timestamp"].dropna() if "block_timestamp" in fdf.columns else pd.Series([], dtype=float)
     if ts.size >= 2:
         col3.metric("Blockchain Time Span (sec)", int(ts.max() - ts.min()))
     else:
@@ -1599,6 +1721,7 @@ def page_smart_contract() -> None:
         st.caption("Per event_type")
         st.dataframe(per_type, use_container_width=True)
 
+    """
     # Plot
     st.write("Event types in filtered df:", fdf["event_type"].value_counts())
     st.subheader("Gas Used Distribution by event type")
@@ -1631,8 +1754,9 @@ def page_smart_contract() -> None:
     ax.tick_params(axis="y", labelsize=8)
     fig.tight_layout()
     st.pyplot(fig, use_container_width=False)
-
-     #plot 2
+    """
+    """"
+    plot 2
     st.subheader("Gas / Latency")
 
     time_df = fdf.copy()
@@ -1676,6 +1800,7 @@ def page_smart_contract() -> None:
         ax.legend(fontsize=6)
         fig.tight_layout()
         st.pyplot(fig, use_container_width=False)
+     """
 
 def page_settings() -> None:
     st.header("Settings")
@@ -1739,3 +1864,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

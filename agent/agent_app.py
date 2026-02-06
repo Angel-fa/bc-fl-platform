@@ -4,13 +4,15 @@ import csv
 import json
 import os
 import time
-import urllib.request
 from typing import Any, Dict, List, Optional
+import urllib.request
+from urllib.parse import unquote
 
 import itertools
 import numpy as np
 import pandas as pd
 
+from fastapi.responses import Response
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from openpyxl import load_workbook
@@ -156,7 +158,7 @@ def _normalize_gender(v: Any) -> Optional[str]:
     if s in ("other", "nonbinary", "non-binary", "nb", "άλλο"):
         return "other"
 
-    return "None"
+    return None
 
 def _compute_gender_stratified_metrics(
     df: pd.DataFrame,
@@ -651,7 +653,7 @@ def health():
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), x_agent_secret: Optional[str] = Header(default=None)):
     _check_secret(x_agent_secret)
-    _ensure_data_dir() # Εξασφαλίζει ότι το data dir υπάρχει
+    _ensure_data_dir()
 
     contents = await file.read()
     if contents is None:
@@ -745,12 +747,13 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             },
         }
 
-    if CONSENT_FILTER_ENABLED:
-        feature_metrics = {}
-        stratified_metrics = {}
-        correlation_matrix = {}
-        normalized_importance = {}
-    else:
+    sufficient_stats = {"present_features": [], "feature_sums": {}, "pair_sums": {}}
+    correlation_matrix = {}
+    normalized_importance = {}
+    feature_metrics = {}
+    stratified_metrics = {}
+
+    if not CONSENT_FILTER_ENABLED:
         try:
             cols_needed = list(features)
             if req.stratify_by:
@@ -765,17 +768,12 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
                     df_enriched = df.sample(n=ENRICHED_SAMPLE_CAP, random_state=42)
 
                 enriched = _compute_enriched_feature_metrics_df(df_enriched, features)
-
                 feature_metrics = enriched.get("feature_metrics", {})
-                # Τα βάζουμε στο metrics για να τα πάρει το UI
                 correlation_matrix = enriched.get("correlation_matrix", {})
                 normalized_importance = enriched.get("normalized_importance", {})
             else:
                 feature_metrics = _compute_feature_metrics_df(df, features, OUTLIER_Z)
-                correlation_matrix = {}
-                normalized_importance = {}
 
-            # Stratified metrics: ΜΟΝΟ για gender, με normalization + privacy threshold ανά group
             if req.stratify_by and req.stratify_by.strip().lower() == "gender":
                 stratified_metrics = _compute_gender_stratified_metrics(
                     df=df,
@@ -784,16 +782,10 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
                     outlier_z=OUTLIER_Z,
                     min_rows_threshold=MIN_ROWS_THRESHOLD,
                 )
-            else:
-                stratified_metrics = {}
         except Exception:
-            feature_metrics = {}
-            stratified_metrics = {}
-            sufficient_stats = {"present_features": [], "feature_sums": {}, "pair_sums": {}}
-            correlation_matrix = {}
-            normalized_importance = {}
+            pass
 
-        return {
+    return {
         "ok": True,
         "row_count": row_count,
         "update": base.get("update") or {},
@@ -804,19 +796,17 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             "privacy": {"min_row_threshold": MIN_ROWS_THRESHOLD, "suppressed": False},
             "effective_row_count": effective_row_count,
             "outlier_z": OUTLIER_Z,
-
             "requested_features": features,
             "missing_features": (base.get("metrics") or {}).get("missing_features", []),
-            "present_features": (base.get("metrics") or {}).get("present_features", []),
 
             "feature_metrics": feature_metrics,
             "stratified_metrics": stratified_metrics,
             "sufficient_stats": sufficient_stats,
             "correlation_matrix": correlation_matrix,
             "normalized_importance": normalized_importance,
-
         },
     }
+
 
 @app.post("/patient/consent-link")
 def patient_consent_link(req: PatientConsentLinkRequest, x_agent_secret: Optional[str] = Header(default=None)):
@@ -840,6 +830,29 @@ def patient_consent_link(req: PatientConsentLinkRequest, x_agent_secret: Optiona
 
     return {"ok": True, "token": sig, "payload": token_payload}
 
+
+
+@app.get("/download")
+def download_file(
+    local_uri: str,
+    x_agent_secret: Optional[str] = Header(default=None),
+):
+
+    _check_secret(x_agent_secret)
+
+    path = (local_uri or "").strip()
+    path = unquote(path)
+
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not os.path.abspath(path).startswith(os.path.abspath(DATA_DIR)):
+        raise HTTPException(status_code=403, detail="Access outside data dir not allowed")
+
+    with open(path, "rb") as f:
+        data = f.read()
+
+    return Response(content=data, media_type="application/octet-stream")
 
 @app.on_event("startup")
 def startup_register():

@@ -4,9 +4,13 @@ import json
 import os
 import time
 import urllib.request
+import urllib.parse
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 import pandas as pd
+import io
+import numpy as np
+
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -110,6 +114,14 @@ def _json_kb(obj: object) -> float:
     except Exception:
         return 0.0
 
+def _http_bytes_get(url: str, headers: Optional[dict] = None, timeout: float = 8.0) -> bytes:
+    req = urllib.request.Request(url, method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
 def _merge_weighted_means(updates: List[dict], weights: List[int]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     keys = set()
@@ -200,14 +212,13 @@ def _feature_metrics_from_merged(merged_fs: Dict[str, dict]) -> Tuple[Dict[str, 
             "missing_rate": float(missing_rate),
             "variance": float(var),
 
-            # αυτά ΔΕΝ μπορούν να συγχωνευτούν ακριβώς χωρίς sketch/hist
-            "median": None,
-            "q1": None,
-            "q3": None,
-            "iqr": None,
-            "outlier_rate": None,
-            "unique_values": None,
-            "is_constant": None,
+            #"median": None,
+            #"q1": None,
+            #"q3": None,
+            #"iqr": None,
+            #"outlier_rate": None,
+            #"unique_values": None,
+            #"is_constant": None,
         }
         variances[feat] = float(var)
 
@@ -619,7 +630,7 @@ def create_access_request(
 
     created = store.create_access_request(payload, actor=actor.username)
 
-    # On-chain gas/latency/throughput
+    # On-chain
     try:
         bc = get_blockchain()
         bc.anchor(
@@ -811,12 +822,31 @@ def list_fl_jobs(
     return [j for j in jobs if (j.created_by or "").strip().lower() == my_user]
 
 @router.get("/fl/jobs/{job_id}", response_model=FLJob, tags=["federation"])
-def get_fl_job(job_id: UUID, actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN))):
+def get_fl_job(
+    job_id: UUID,
+    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_BIOBANK, ROLE_RESEARCHER, ROLE_ADMIN)),
+):
     store = get_store()
     job = store.get_fl_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # (προαιρετικά) access filtering όπως στο list_fl_jobs
+
+    # Admin: βλέπει όλα
+    if actor.role == ROLE_ADMIN:
+        return job
+
+    # Hospital: μόνο αν το primary dataset ανήκει στο org του
+    if actor.role == ROLE_HOSPITAL:
+        ds = store.get_dataset(job.dataset_id)
+        if not ds or not _dataset_owned_by_org(ds, actor.org):
+            raise HTTPException(status_code=403, detail="Job not in your organization scope")
+        return job
+
+    # Researcher / Biobank: μόνο αν το δημιούργησε ο ίδιος
+    my_user = (actor.username or "").strip().lower()
+    if (job.created_by or "").strip().lower() != my_user:
+        raise HTTPException(status_code=403, detail="Job not in your user scope")
+
     return job
 
 @router.post("/fl/jobs/{job_id}/start", response_model=FLJob, tags=["federation"])
@@ -1025,9 +1055,17 @@ def start_fl_job(
                 corr = _corr_from_pair_sums(merged_pairs, features=(present_features_union or (job.features or [])))
 
                 thr = max(min_row_thresholds) if min_row_thresholds else None
+
+                # Global suppression μόνο αν το συνολικό effective sample είναι κάτω από threshold
+                global_suppressed = bool(thr is not None and total_rows < int(thr))
+
+                suppressed_nodes = int(sum(1 for w in round_weights if int(w or 0) == 0))
+
                 priv = {
                     "min_row_threshold": thr,
-                    "suppressed": bool(any_suppressed or (thr is not None and total_rows < int(thr))),
+                    "suppressed": global_suppressed,
+                    "nodes_suppressed": suppressed_nodes,
+                    "participants": int(len(round_nodes)),
                 }
 
                 merged["feature_metrics"] = fm
@@ -1157,6 +1195,126 @@ def start_fl_job(
             pass
 
         raise HTTPException(status_code=500, detail=f"FL job failed: {e}")
+
+
+@router.post("/fl/jobs/{job_id}/baseline", response_model=dict, tags=["federation"])
+def compute_baseline_for_job(
+    job_id: UUID,
+    actor: Actor = Depends(require_roles(ROLE_ADMIN, ROLE_HOSPITAL)),
+):
+    store = get_store()
+    job = store.get_fl_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # scope datasets
+    scope = (getattr(job, "scope", None) or "single_node").strip()
+    if scope == "multi_node":
+        ds_ids = list(getattr(job, "dataset_ids", None) or [])
+        if not ds_ids:
+            ds_ids = [job.dataset_id]
+    else:
+        ds_ids = [job.dataset_id]
+
+    # Hospital access control (αν Hospital, μόνο δικά του datasets)
+    if actor.role == ROLE_HOSPITAL:
+        for did in ds_ids:
+            ds = store.get_dataset(did)
+            if not ds:
+                raise HTTPException(status_code=404, detail=f"Dataset not found: {did}")
+            if not _dataset_owned_by_org(ds, actor.org):
+                raise HTTPException(status_code=403, detail="Baseline not allowed outside your org scope")
+
+    feats = list(getattr(job, "features", None) or [])
+    if not feats:
+        raise HTTPException(status_code=400, detail="Job has no features selected")
+
+    frames = []
+    used = []
+    for did in ds_ids:
+        ds = store.get_dataset(did)
+        if not ds:
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {did}")
+
+        node = store.get_node(ds.node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"Node not found for dataset: {did}")
+
+        url = f"{node.base_url.rstrip('/')}/download?local_uri={urllib.parse.quote(ds.local_uri or '')}"
+        raw = _http_bytes_get(url, headers={"X-Agent-Secret": AGENT_REG_SECRET}, timeout=AGENT_CALL_TIMEOUT)
+
+        name = (ds.local_uri or "").lower()
+        bio = io.BytesIO(raw)
+
+        if name.endswith((".xlsx", ".xls", ".xlsm", ".xltx", ".xltm")):
+            df = pd.read_excel(bio)
+        else:
+            df = pd.read_csv(bio)
+
+        cols_present = [c for c in feats if c in df.columns]
+        if not cols_present:
+            continue
+
+        df = df[cols_present].copy()
+        for c in cols_present:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        frames.append(df)
+        used.append(str(did))
+
+    if not frames:
+        raise HTTPException(status_code=400, detail="No datasets could be loaded for baseline")
+
+    all_df = pd.concat(frames, axis=0, ignore_index=True)
+
+    # feature_metrics
+    feature_metrics = {}
+    variances = {}
+    total_rows = int(len(all_df))
+    for f in feats:
+        if f not in all_df.columns:
+            continue
+        s = all_df[f]
+        n = int(s.notna().sum())
+        miss = int(total_rows - n)
+        missing_rate = float(miss / max(total_rows, 1))
+
+        mean = float(s.mean(skipna=True)) if n > 0 else 0.0
+        std = float(s.std(skipna=True, ddof=0)) if n > 0 else 0.0  # population std
+        vmin = float(s.min(skipna=True)) if n > 0 else 0.0
+        vmax = float(s.max(skipna=True)) if n > 0 else 0.0
+        var = float(std * std)
+
+        feature_metrics[f] = {
+            "mean": mean, "std": std, "min": vmin, "max": vmax,
+            "missing_rate": missing_rate, "variance": var,
+            #"median": None, "q1": None, "q3": None, "iqr": None,
+            #"outlier_rate": None, "unique_values": None,
+            #"is_constant": None,
+        }
+        variances[f] = var
+
+    #  normalized
+    total_var = float(sum(max(x, 0.0) for x in variances.values()))
+    normalized_importance = {k: (max(v, 0.0) / total_var if total_var > 0 else 0.0) for k, v in variances.items()}
+
+    # correlation_matrix
+    corr_df = all_df[ [c for c in feats if c in all_df.columns] ].corr(method="pearson")
+    corr = {c: {r: float(corr_df.loc[r, c]) for r in corr_df.index} for c in corr_df.columns}
+
+    baseline_global_model = {f: float(feature_metrics[f]["mean"]) for f in feature_metrics.keys()}
+
+    return {
+        "job_id": str(job.job_id),
+        "dataset_ids": used,
+        "baseline": {
+            "total_rows": total_rows,
+            "feature_metrics": feature_metrics,
+            "normalized_importance": normalized_importance,
+            "correlation_matrix": corr,
+            "baseline_global_model": baseline_global_model,
+        },
+    }
 
 # Runs / History
 @router.post("/runs", response_model=Run, tags=["core"])
