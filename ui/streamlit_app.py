@@ -237,7 +237,7 @@ def _compare_corr(ma: dict, mb: dict) -> dict:
 
 def _topk_overlap(da: dict, db: dict, k: int = 10) -> dict:
     if not isinstance(da, dict) or not isinstance(db, dict) or not da or not db:
-        return {"ok": False, "reason": "missing normalized_importance"}
+        return {"ok": False, "reason": "missing normalized_feature"}
 
     sa = pd.Series(da).apply(pd.to_numeric, errors="coerce").dropna().sort_values(ascending=False)
     sb = pd.Series(db).apply(pd.to_numeric, errors="coerce").dropna().sort_values(ascending=False)
@@ -291,7 +291,7 @@ def suggest_actions(metrics: dict) -> list[str]:
             if s.get("is_constant") is True:
                 actions.append(f"[Data Quality] '{feat}' φαίνεται constant/zero: πρότεινε αφαίρεση feature.")
 
-    # Privacy / governance
+    # Privacy governance
     privacy = metrics.get("privacy") or {}
     if isinstance(privacy, dict) and privacy:
         thr = privacy.get("min_row_threshold")
@@ -1087,10 +1087,10 @@ def page_federated_jobs() -> None:
         "Select which analytics sections to display",
         options=[
             "Performance Summary",
-            "Execution / Telemetry",
-            "Privacy / Governance",
-            "Feature Metrics (Distribution & Data Quality)",
-            "Normalized Importance",
+            "Telemetry",
+            "Privacy Governance",
+            "Feature Metrics",
+            "Normalized Feature",
             "Round Trends",
             "Correlation Matrix",
             #"Raw JSON (debug)",
@@ -1126,8 +1126,8 @@ def page_federated_jobs() -> None:
             metrics["_ui_metrics_size_kb"] = _json_size_kb(metrics)
 
             # Execution / Telemetry
-            if "Execution / Telemetry" in sections:
-                st.subheader("Execution / Telemetry")
+            if "Telemetry" in sections:
+                st.subheader("Telemetry")
 
                 exec_row = {
                     "scope": metrics.get("scope"),
@@ -1203,16 +1203,16 @@ def page_federated_jobs() -> None:
                 col2.metric("Response size (KB)", metrics.get("_ui_response_size_kb"))
                 col3.metric("Metrics size (KB)", metrics.get("_ui_metrics_size_kb"))
 
-            # Privacy / Governance
+            # Privacy Governance
             privacy = metrics.get("privacy") or {}
-            if "Privacy / Governance" in sections and privacy:
-                st.subheader("Privacy / Governance")
+            if "Privacy Governance" in sections and privacy:
+                st.subheader("Privacy Governance")
                 st.json(privacy)
 
             # Feature metrics
             feature_metrics = metrics.get("feature_metrics") or metrics.get("feature_stats") or {}
-            if "Feature Metrics (Distribution & Data Quality)" in sections and feature_metrics:
-                st.subheader("Feature Metrics (Distribution & Data Quality)")
+            if "Feature Metrics" in sections and feature_metrics:
+                st.subheader("Feature Metrics")
                 try:
                     fm_df = (
                         pd.DataFrame.from_dict(feature_metrics, orient="index")
@@ -1231,10 +1231,10 @@ def page_federated_jobs() -> None:
                 except Exception:
                     st.json(feature_metrics)
 
-            # Normalized importance
-            norm_imp = metrics.get("normalized_importance")
-            if "Normalized Importance" in sections and norm_imp:
-                st.subheader("Normalized Feature Importance")
+            # Normalized
+            norm_imp = metrics.get("normalized_feature")
+            if "Normalized Feature" in sections and norm_imp:
+                st.subheader("Normalized Feature")
                 st.json(norm_imp)
 
             # Round trends
@@ -1316,7 +1316,7 @@ def page_federated_jobs() -> None:
 
     # Admin: Compare FL Jobs
     st.divider()
-    st.subheader("FL vs Baseline \n (only admin - for test cases hospital)")
+    st.subheader("Federated Learning vs Centralized model \n (only admin - for test cases hospital)")
 
     if role_norm() in ("Admin", "Hospital"):
 
@@ -1358,7 +1358,7 @@ def page_federated_jobs() -> None:
 
             mb = {
                 "feature_metrics": baseline.get("feature_metrics") or {},
-                "normalized_importance": baseline.get("normalized_importance") or {},
+                "normalized_feature": baseline.get("normalized_feature") or {},
                 "correlation_matrix": baseline.get("correlation_matrix") or {},
                 "privacy": {"suppressed": False, "min_row_threshold": None},
             }
@@ -1417,15 +1417,15 @@ def page_federated_jobs() -> None:
             st.json(corr_summary)
 
             # Normalized importance compare
-            ni_a = ma.get("normalized_importance") or {}
-            ni_b = mb.get("normalized_importance") or {}
+            ni_a = ma.get("normalized_feature") or {}
+            ni_b = mb.get("normalized_feature") or {}
             k = st.slider("Top-K for importance overlap", min_value=5, max_value=30, value=10, step=1, key="cmp_topk")
             ni_summary = _topk_overlap(ni_a, ni_b, k=k)
-            st.caption("Normalized Importance (Top-K overlap)")
+            st.caption("Normalized Feature (Top-K overlap)")
             st.json(ni_summary)
 
             # Privacy/Governance compare
-            st.caption("Privacy / Governance (A vs B)")
+            st.caption("Privacy Governance (A vs B)")
             st.dataframe(pd.DataFrame([{
                 "A_suppressed": (ma.get("privacy") or {}).get("suppressed"),
                 "B_suppressed": (mb.get("privacy") or {}).get("suppressed"),
@@ -1722,7 +1722,7 @@ def page_smart_contract() -> None:
         st.dataframe(per_type, use_container_width=True)
 
     """
-    # Plot
+    Plot
     st.write("Event types in filtered df:", fdf["event_type"].value_counts())
     st.subheader("Gas Used Distribution by event type")
 
@@ -1755,7 +1755,7 @@ def page_smart_contract() -> None:
     fig.tight_layout()
     st.pyplot(fig, use_container_width=False)
     """
-    """"
+    """
     plot 2
     st.subheader("Gas / Latency")
 

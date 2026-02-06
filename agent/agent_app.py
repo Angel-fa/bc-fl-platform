@@ -295,7 +295,7 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
         }
 
     total_var = float(sum(max(v, 0.0) for v in variances.values()))
-    normalized_importance = {
+    normalized_feature = {
         k: (float(max(v, 0.0)) / total_var if total_var > 0 else 0.0)
         for k, v in variances.items()
     }
@@ -311,7 +311,7 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
 
     return {
         "feature_metrics": feature_metrics,
-        "normalized_importance": normalized_importance,
+        "normalized_feature": normalized_feature,
         "correlation_matrix": corr_matrix,
         "present_features": present_features,  # χρήσιμο debug
     }
@@ -749,7 +749,7 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
 
     sufficient_stats = {"present_features": [], "feature_sums": {}, "pair_sums": {}}
     correlation_matrix = {}
-    normalized_importance = {}
+    normalized_feature = {}
     feature_metrics = {}
     stratified_metrics = {}
 
@@ -770,7 +770,7 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
                 enriched = _compute_enriched_feature_metrics_df(df_enriched, features)
                 feature_metrics = enriched.get("feature_metrics", {})
                 correlation_matrix = enriched.get("correlation_matrix", {})
-                normalized_importance = enriched.get("normalized_importance", {})
+                normalized_feature = enriched.get("normalized_feature", {})
             else:
                 feature_metrics = _compute_feature_metrics_df(df, features, OUTLIER_Z)
 
@@ -803,7 +803,7 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             "stratified_metrics": stratified_metrics,
             "sufficient_stats": sufficient_stats,
             "correlation_matrix": correlation_matrix,
-            "normalized_importance": normalized_importance,
+            "normalized_feature": normalized_feature,
         },
     }
 

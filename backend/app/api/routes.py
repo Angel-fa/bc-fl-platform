@@ -223,12 +223,12 @@ def _feature_metrics_from_merged(merged_fs: Dict[str, dict]) -> Tuple[Dict[str, 
         variances[feat] = float(var)
 
     total_var = float(sum(max(x, 0.0) for x in variances.values()))
-    normalized_importance = {
+    normalized_feature = {
         k: (max(v, 0.0) / total_var if total_var > 0 else 0.0)
         for k, v in variances.items()
     }
 
-    return feature_metrics, normalized_importance
+    return feature_metrics, normalized_feature
 
 
 def _merge_pair_sums(suffs: List[dict]) -> Dict[str, dict]:
@@ -907,7 +907,7 @@ def start_fl_job(
         merged["per_node_row_counts"] = []
 
         merged["feature_metrics"] = {}
-        merged["normalized_importance"] = {}
+        merged["normalized_feature"] = {}
         merged["correlation_matrix"] = {}
         merged["privacy"] = {}
         merged.pop("debug_sufficient_stats", None)
@@ -1069,7 +1069,7 @@ def start_fl_job(
                 }
 
                 merged["feature_metrics"] = fm
-                merged["normalized_importance"] = ni
+                merged["normalized_feature"] = ni
                 merged["correlation_matrix"] = corr
                 merged["privacy"] = priv
 
@@ -1112,7 +1112,7 @@ def start_fl_job(
         if last_feature_metrics:
             merged["feature_metrics"] = last_feature_metrics
         if last_norm_imp:
-            merged["normalized_importance"] = last_norm_imp
+            merged["normalized_feature"] = last_norm_imp
         if last_corr:
             merged["correlation_matrix"] = last_corr
         if last_privacy:
@@ -1296,7 +1296,7 @@ def compute_baseline_for_job(
 
     #  normalized
     total_var = float(sum(max(x, 0.0) for x in variances.values()))
-    normalized_importance = {k: (max(v, 0.0) / total_var if total_var > 0 else 0.0) for k, v in variances.items()}
+    normalized_feature = {k: (max(v, 0.0) / total_var if total_var > 0 else 0.0) for k, v in variances.items()}
 
     # correlation_matrix
     corr_df = all_df[ [c for c in feats if c in all_df.columns] ].corr(method="pearson")
@@ -1310,7 +1310,7 @@ def compute_baseline_for_job(
         "baseline": {
             "total_rows": total_rows,
             "feature_metrics": feature_metrics,
-            "normalized_importance": normalized_importance,
+            "normalized_feature": normalized_feature,
             "correlation_matrix": corr,
             "baseline_global_model": baseline_global_model,
         },
