@@ -25,6 +25,9 @@
 Μετάβαση στον φάκελο που θέλετε να βρίσκεται το project
 
 ```
+cd ~
+```
+```
 cd Desktop
 ```
 
@@ -40,7 +43,7 @@ git clone https://github.com/Angel-fa/bc-fl-platform.git
 
 Είσοδος στον φάκελο του project
 
-```
+``` 
 cd bc-fl-platform
 ```
 
