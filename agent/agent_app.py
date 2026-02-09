@@ -30,9 +30,9 @@ HOSPITAL_ORG = os.getenv("HOSPITAL_ORG", "HospitalA")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://hospital_a_agent:9001")
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))  # Μέγιστο μέγεθος upload για προστασία
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 OUTLIER_Z = float(os.getenv("OUTLIER_Z", "3.0"))
-MIN_ROWS_THRESHOLD = int(os.getenv("MIN_ROWS_THRESHOLD", "50")) # Privacy threshold: κάτω από αυτό -> suppression (δεν επιστρέφει aggregates) (fl-job)
+MIN_ROWS_THRESHOLD = int(os.getenv("MIN_ROWS_THRESHOLD", "50"))
 
 ML_ENABLED = str(os.getenv("ML_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
@@ -828,7 +828,6 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
         df = _read_df_for_metrics(req.local_uri, cols_needed, max_rows=200000)
 
         if CONSENT_FILTER_ENABLED and PATIENT_ID_COLUMN in df.columns:
-            # Φτιάχνω mask consent ανά row (προσοχή: αυτό κάνει calls/cache)
             pid_series = df[PATIENT_ID_COLUMN].astype(str).fillna("").str.strip()
             consent_mask = pid_series.apply(lambda pid: bool(pid) and _has_consent_cached(req.dataset_id, pid))
             df = df.loc[consent_mask].copy()
@@ -985,7 +984,6 @@ def patient_consent_link(req: PatientConsentLinkRequest, x_agent_secret: Optiona
         "ts": int(time.time()),
     }
 
-    # το JSON έχει πάντα την ίδια μορφή -άρα το hash θα είναι ίδιο για τα ίδια δεδομένα (deterministic serialization.)
     raw = json.dumps(token_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
     import hashlib

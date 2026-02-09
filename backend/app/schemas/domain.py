@@ -106,11 +106,11 @@ class DatasetCreate(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = Field(default=None, max_length=500)
 
-    owner_org: str = Field(..., min_length=1)  # enforced στο routes.py από actor.org
+    owner_org: str = Field(..., min_length=1)
     sensitivity_level: SensitivityLevel = SensitivityLevel.low
 
     schema_id: Optional[str] = None
-    local_uri: Optional[str] = None # δείχνει σε path που μπορεί να ανοίξει ο agent
+    local_uri: Optional[str] = None
     node_id: UUID
 
 
