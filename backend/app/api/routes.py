@@ -11,8 +11,7 @@ import pandas as pd
 import io
 import numpy as np
 
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query,Body
 
 from app.routes.auth_routes import router as auth_router
 from app.routes.admin_routes import router as admin_router
@@ -852,8 +851,10 @@ def get_fl_job(
 @router.post("/fl/jobs/{job_id}/start", response_model=FLJob, tags=["federation"])
 def start_fl_job(
     job_id: UUID,
-    actor: Actor = Depends(require_roles(ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
+    body: dict = Body(default={}),
+    actor: Actor = Depends(require_roles(ROLE_ADMIN, ROLE_HOSPITAL, ROLE_RESEARCHER, ROLE_BIOBANK)),
 ):
+    include_norm = bool((body or {}).get("include_normalized_samples", False))
     store = get_store()
 
     job = store.get_fl_job(job_id)
@@ -894,15 +895,16 @@ def start_fl_job(
     store.update_fl_job(job, actor=actor.username, audit_event=None)
 
     job_start = time.perf_counter()
+    merged = dict(job.metrics or {})
 
     try:
         global_model: dict = {}
 
-        merged = dict(job.metrics or {})
+        if not isinstance(merged.get("round_trends"), list):
+            merged["round_trends"] = []
 
         merged["round_durations_sec"] = []
         merged["round_payload_kb"] = []
-        merged["round_trends"] = {}
         merged["per_node_row_counts"] = []
 
         merged["feature_metrics"] = {}
@@ -921,6 +923,9 @@ def start_fl_job(
         merged["avg_round_duration_sec"] = None
         merged["avg_round_payload_kb"] = None
 
+        merged["normalized_samples"] = []
+        merged["normalized_samples_included"] = False
+
         job.metrics = merged
         store.update_fl_job(job, actor=actor.username, audit_event=None)
 
@@ -931,6 +936,10 @@ def start_fl_job(
 
         for r in range(1, int(job.rounds) + 1):
             round_start = time.perf_counter()
+
+            if include_norm:
+                merged["normalized_samples"] = []
+                merged["normalized_samples_included"] = False
 
             round_updates = []
             round_weights = []
@@ -956,6 +965,7 @@ def start_fl_job(
                         "schema_id": ds.schema_id,
                         "features": job.features,
                         "label": job.label,
+                        "include_normalized_samples": bool(include_norm),
                     },
                     headers={"X-Agent-Secret": AGENT_REG_SECRET},
                     timeout=AGENT_CALL_TIMEOUT,
@@ -963,6 +973,16 @@ def start_fl_job(
 
                 node_metrics = resp.get("metrics") or {}
                 privacy = {}
+
+                if include_norm and isinstance(node_metrics, dict):
+                    ns = node_metrics.get("normalized_samples") or []
+                    if isinstance(ns, list) and ns:
+                        for row in ns:
+                            if isinstance(row, dict):
+                                row["_node_id"] = str(node.node_id)
+                        merged["normalized_samples"].extend(ns)
+                        merged["normalized_samples_included"] = True
+
                 if isinstance(node_metrics, dict):
                     privacy = node_metrics.get("privacy") or {}
                 if not isinstance(privacy, dict):
@@ -1012,16 +1032,11 @@ def start_fl_job(
                                     present_features_union.append(str(x))
 
             total_rows = int(sum(round_weights))
-
-            if total_rows <= 0:
-                global_model = {}
-            else:
-                global_model = _merge_weighted_means(round_updates, round_weights)
+            global_model = {}
 
             round_end = time.perf_counter()
             round_duration = round(round_end - round_start, 4)
 
-            # metrics basic
             merged["last_round_row_count"] = total_rows
             merged["last_round"] = r
 
@@ -1036,24 +1051,52 @@ def start_fl_job(
                 {round_nodes[i]: int(round_weights[i]) for i in range(len(round_nodes))}
             )
 
-            # round trends on GLOBAL aggregates
-            round_trends = merged.get("round_trends") or {}
-            for k, v in (global_model or {}).items():
-                key = f"{k}_mean"
-                round_trends.setdefault(key, [])
-                round_trends[key].append(float(v))
-            merged["round_trends"] = round_trends
+            merged.setdefault("round_trends", [])
+            if not isinstance(merged["round_trends"], list):
+                merged["round_trends"] = []
 
             if round_suffs:
                 merged_fs = _merge_feature_sums(round_suffs)
                 fm, ni = _feature_metrics_from_merged(merged_fs)
+
+                thr = max(min_row_thresholds) if min_row_thresholds else None
+                global_suppressed = bool(thr is not None and total_rows < int(thr))
+
+                merged.setdefault("round_trends", [])
+
+                rt_row = {
+                    "round": int(r),
+                    "round_duration_sec": float(round_duration),
+                    "total_rows": int(total_rows),
+                    "participants": int(len(round_nodes)),
+                    "suppressed": bool(global_suppressed),
+                    "payload_kb": float(payload_kb),
+                    "nodes_suppressed": int(sum(1 for w in round_weights if int(w or 0) == 0)),
+                    "min_row_threshold": int(thr) if thr is not None else None,
+                }
+
+                for feat in (job.features or []):
+                    if feat in fm:
+                        rt_row[f"mean_{feat}"] = float(fm[feat].get("mean", 0.0))
+                    else:
+                        rt_row[f"mean_{feat}"] = None
+
+                merged["round_trends"].append(rt_row)
+
+                scaler_global = {}
+                for feat, agg in (merged_fs or {}).items():
+                    n = int(agg.get("n") or 0)
+                    mean = float(fm.get(feat, {}).get("mean") or 0.0)
+                    std = float(fm.get(feat, {}).get("std") or 0.0)
+                    scaler_global[feat] = {"n": n, "mean": mean, "std": std}
+
+                merged["scaler_global"] = scaler_global
 
                 merged_pairs = _merge_pair_sums(round_suffs)
                 corr = _corr_from_pair_sums(merged_pairs, features=(present_features_union or (job.features or [])))
 
                 thr = max(min_row_thresholds) if min_row_thresholds else None
 
-                # Global suppression μόνο αν το συνολικό effective sample είναι κάτω από threshold
                 global_suppressed = bool(thr is not None and total_rows < int(thr))
 
                 suppressed_nodes = int(sum(1 for w in round_weights if int(w or 0) == 0))
@@ -1376,7 +1419,7 @@ def list_audit(
 # Blockchain receipts
 @router.get("/blockchain/receipts", response_model=List[dict], tags=["core"])
 def list_blockchain_receipts(
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=200, ge=1, le=1000000),
     actor: Actor = Depends(require_roles("Admin", "Hospital", "Biobank", "Researcher")),
 ):
     store = get_store()

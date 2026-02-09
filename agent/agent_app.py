@@ -16,6 +16,9 @@ from fastapi.responses import Response
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from openpyxl import load_workbook
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import log_loss, accuracy_score
+
 
 
 # Env
@@ -31,6 +34,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))  #
 OUTLIER_Z = float(os.getenv("OUTLIER_Z", "3.0"))
 MIN_ROWS_THRESHOLD = int(os.getenv("MIN_ROWS_THRESHOLD", "50")) # Privacy threshold: κάτω από αυτό -> suppression (δεν επιστρέφει aggregates) (fl-job)
 
+ML_ENABLED = str(os.getenv("ML_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 # Consent filtering
 
@@ -39,6 +43,7 @@ PATIENT_ID_COLUMN = os.getenv("PATIENT_ID_COLUMN", "patient_id")
 PATIENT_PORTAL_SECRET = os.getenv("PATIENT_PORTAL_SECRET", "")
 ENRICHED_METRICS_ENABLED = str(os.getenv("ENRICHED_METRICS_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 ENRICHED_SAMPLE_CAP = int(os.getenv("ENRICHED_SAMPLE_CAP", "20000"))
+NORMALIZED_PREVIEW_ROWS = 50
 
 # Δημιουργία FastAPI
 app = FastAPI(title="BCFL Hospital Agent")
@@ -60,6 +65,7 @@ class TrainRoundRequest(BaseModel):
     features: List[str] = Field(default_factory=list)
     label: Optional[str] = None
     stratify_by: Optional[str] = None
+    include_normalized_samples: bool = False
 
 
 class PatientConsentLinkRequest(BaseModel):
@@ -109,20 +115,25 @@ def _read_xlsx_head(path: str, max_rows: int = 5000) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {"ok": False, "error": f"File not found: {path}"}
 
+    wb = None
     wb = load_workbook(filename=path, read_only=True, data_only=True)
-    ws = wb.active
+    try:
+        ws = wb.active
 
-    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-    if not header_row:
-        return {"ok": False, "error": "Empty Excel file"}
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            return {"ok": False, "error": "Empty Excel file"}
 
-    cols = [str(c).strip() for c in header_row if c is not None and str(c).strip() != ""]
+        cols = [str(c).strip() for c in header_row if c is not None and str(c).strip() != ""]
 
-    n = 0
-    for _ in ws.iter_rows(min_row=2, max_row=1 + max_rows, values_only=True):
-        n += 1
+        n = 0
+        for _ in ws.iter_rows(min_row=2, max_row=1 + max_rows, values_only=True):
+            n += 1
 
-    return {"ok": True, "columns": cols, "row_count": n}
+        return {"ok": True, "columns": cols, "row_count": n}
+    finally:
+        if wb is not None:
+            wb.close()
 
 
 def _detect_columns(path: str) -> Dict[str, Any]:
@@ -197,6 +208,63 @@ def _compute_gender_stratified_metrics(
         }
 
     return out
+
+def _scaler_from_sufficient_stats(sufficient_stats: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    fs = (sufficient_stats or {}).get("feature_sums") or {}
+    out: Dict[str, Dict[str, float]] = {}
+
+    for feat, s in fs.items():
+        if not isinstance(s, dict):
+            continue
+        n = int(s.get("n") or 0)
+        if n <= 1:
+            continue
+
+        sm = float(s.get("sum") or 0.0)
+        ss = float(s.get("sumsq") or 0.0)
+
+        mean = sm / n
+        var = (ss / n) - (mean * mean)
+        if var < 0:
+            var = 0.0
+        std = float(np.sqrt(var))
+
+        out[str(feat)] = {"mean": float(mean), "std": float(std), "n": float(n)}
+
+    return out
+
+
+# NORMALIZATION ΓΙΑ ML
+
+def _scaler_stats_from_df(df: pd.DataFrame, features: List[str]):
+    stats = {}
+    for f in features:
+        if f not in df.columns:
+            continue
+        x = pd.to_numeric(df[f], errors="coerce").dropna()
+        stats[f] = {
+            "n": int(len(x)),
+            "mean": float(x.mean()) if len(x) else 0.0,
+            "std": float(x.std(ddof=0)) if len(x) else 0.0,
+        }
+    return stats
+
+
+def _apply_zscore(df: pd.DataFrame, scaler_stats: dict, eps: float = 1e-12) -> pd.DataFrame:
+    out = df.copy()
+    for f, s in scaler_stats.items():
+        if f not in out.columns:
+            continue
+        mu = float(s.get("mean", 0.0))
+        sd = float(s.get("std", 0.0))
+        col = pd.to_numeric(out[f], errors="coerce")
+
+        if sd <= eps:
+            out[f] = 0.0
+        else:
+            out[f] = (col - mu) / sd # ΤΥΠΟΣ z = (x - μ) / σ
+    return out
+
 
 # Consent
 
@@ -273,7 +341,7 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
         median = float(non_na.median()) if len(non_na) else 0.0
 
         iqr = _iqr_stats(non_na) if len(non_na) else {"q1": 0.0, "q3": 0.0, "iqr": 0.0}
-        outlier_rate = _outlier_rate_zscore(non_na, z=3.0) if len(non_na) else 0.0
+        outlier_rate = _outlier_rate_zscore(non_na, z=OUTLIER_Z) if len(non_na) else 0.0
 
         var = float(non_na.var(ddof=0)) if len(non_na) else 0.0
         variances[feat] = var
@@ -294,12 +362,6 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
             "variance": var,
         }
 
-    total_var = float(sum(max(v, 0.0) for v in variances.values()))
-    normalized_feature = {
-        k: (float(max(v, 0.0)) / total_var if total_var > 0 else 0.0)
-        for k, v in variances.items()
-    }
-
     # Pearson correlation matrix
     corr_matrix: Dict[str, Dict[str, float]] = {}
     if len(present_features) >= 2:
@@ -311,7 +373,6 @@ def _compute_enriched_feature_metrics_df(df: pd.DataFrame, features: List[str]) 
 
     return {
         "feature_metrics": feature_metrics,
-        "normalized_feature": normalized_feature,
         "correlation_matrix": corr_matrix,
         "present_features": present_features,  # χρήσιμο debug
     }
@@ -397,69 +458,72 @@ def _compute_feature_means_xlsx(
     if not os.path.exists(path):
         return {"ok": False, "error": f"File not found: {path}"}
 
-    wb = load_workbook(filename=path, read_only=True, data_only=True)
-    ws = wb.active
+    try:
+        wb = load_workbook(filename=path, read_only=True, data_only=True)
+        ws = wb.active
 
-    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-    if not header_row:
-        return {"ok": False, "error": "Empty Excel file"}
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            return {"ok": False, "error": "Empty Excel file"}
 
-    cols = [str(c).strip() if c is not None else "" for c in header_row]
-    col_index = {name: idx for idx, name in enumerate(cols) if name}
+        cols = [str(c).strip() if c is not None else "" for c in header_row]
+        col_index = {name: idx for idx, name in enumerate(cols) if name}
 
-    pid_idx = col_index.get(PATIENT_ID_COLUMN) if CONSENT_FILTER_ENABLED else None
+        pid_idx = col_index.get(PATIENT_ID_COLUMN) if CONSENT_FILTER_ENABLED else None
 
-    sums: Dict[str, float] = {f: 0.0 for f in features}
-    counts: Dict[str, int] = {f: 0 for f in features}
+        sums: Dict[str, float] = {f: 0.0 for f in features}
+        counts: Dict[str, int] = {f: 0 for f in features}
 
-    rows_total = 0
-    rows_used = 0
-    rows_skipped_no_consent = 0
+        rows_total = 0
+        rows_used = 0
+        rows_skipped_no_consent = 0
 
-    for row in ws.iter_rows(min_row=2, max_row=1 + max_rows, values_only=True):
-        rows_total += 1
+        for row in ws.iter_rows(min_row=2, max_row=1 + max_rows, values_only=True):
+            rows_total += 1
 
-        if CONSENT_FILTER_ENABLED:
-            pid = ""
-            if pid_idx is not None and pid_idx < len(row):
-                pid = str(row[pid_idx] or "").strip()
-            if not pid or not _has_consent_cached(dataset_id, pid):
-                rows_skipped_no_consent += 1
-                continue
+            if CONSENT_FILTER_ENABLED:
+                pid = ""
+                if pid_idx is not None and pid_idx < len(row):
+                    pid = str(row[pid_idx] or "").strip()
+                if not pid or not _has_consent_cached(dataset_id, pid):
+                    rows_skipped_no_consent += 1
+                    continue
 
-        rows_used += 1
+            rows_used += 1
+
+            for feat in features:
+                idx = col_index.get(feat)
+                if idx is None or idx >= len(row):
+                    continue
+                v = _safe_float(row[idx])
+                if v is not None:
+                    sums[feat] += v
+                    counts[feat] += 1
+
+        means: Dict[str, float] = {}
+        missing_features: List[str] = []
 
         for feat in features:
-            idx = col_index.get(feat)
-            if idx is None or idx >= len(row):
-                continue
-            v = _safe_float(row[idx])
-            if v is not None:
-                sums[feat] += v
-                counts[feat] += 1
+            if counts[feat] > 0:
+                means[feat] = sums[feat] / float(counts[feat])
+            else:
+                missing_features.append(feat)
 
-    means: Dict[str, float] = {}
-    missing_features: List[str] = []
-
-    for feat in features:
-        if counts[feat] > 0:
-            means[feat] = sums[feat] / float(counts[feat])
-        else:
-            missing_features.append(feat)
-
-    return {
-        "ok": True,
-        "row_count": rows_total,
-        "update": means,
-        "metrics": {
-            "rows_processed": rows_total,
-            "rows_used": rows_used,
-            "rows_skipped_no_consent": rows_skipped_no_consent,
-            "consent_filter_enabled": CONSENT_FILTER_ENABLED,
-            "patient_id_column": PATIENT_ID_COLUMN if CONSENT_FILTER_ENABLED else None,
-            "missing_features": missing_features,
-        },
-    }
+        return {
+            "ok": True,
+            "row_count": rows_total,
+            "update": means,
+            "metrics": {
+                "rows_processed": rows_total,
+                "rows_used": rows_used,
+                "rows_skipped_no_consent": rows_skipped_no_consent,
+                "consent_filter_enabled": CONSENT_FILTER_ENABLED,
+                "patient_id_column": PATIENT_ID_COLUMN if CONSENT_FILTER_ENABLED else None,
+                "missing_features": missing_features,
+            },
+        }
+    finally:
+        wb.close()
 
 def _compute_feature_means(
         path: str, features: List[str],
@@ -749,28 +813,55 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
 
     sufficient_stats = {"present_features": [], "feature_sums": {}, "pair_sums": {}}
     correlation_matrix = {}
-    normalized_feature = {}
     feature_metrics = {}
     stratified_metrics = {}
+    normalized_samples: List[Dict[str, Any]] = []
 
-    if not CONSENT_FILTER_ENABLED:
-        try:
-            cols_needed = list(features)
-            if req.stratify_by:
-                cols_needed.append(req.stratify_by)
+    scaler_global: Dict[str, Dict[str, float]] = {}
+    scaler_local: Dict[str, Dict[str, float]] = {}
 
-            df = _read_df_for_metrics(req.local_uri, cols_needed, max_rows=200000)
+    try:
+        cols_needed = list(features)
+        if req.stratify_by:
+            cols_needed.append(req.stratify_by)
+
+        df = _read_df_for_metrics(req.local_uri, cols_needed, max_rows=200000)
+
+        if CONSENT_FILTER_ENABLED and PATIENT_ID_COLUMN in df.columns:
+            # Φτιάχνω mask consent ανά row (προσοχή: αυτό κάνει calls/cache)
+            pid_series = df[PATIENT_ID_COLUMN].astype(str).fillna("").str.strip()
+            consent_mask = pid_series.apply(lambda pid: bool(pid) and _has_consent_cached(req.dataset_id, pid))
+            df = df.loc[consent_mask].copy()
+
+        if len(df) >= MIN_ROWS_THRESHOLD:
             sufficient_stats = _compute_sufficient_stats_df(df, features)
+            scaler_global = _scaler_from_sufficient_stats(sufficient_stats)
+
+
+            if req.include_normalized_samples and scaler_global:
+                cap = NORMALIZED_PREVIEW_ROWS
+
+                scaler_stats = {
+                    f: {"mean": float(s.get("mean", 0.0)), "std": float(s.get("std", 0.0))}
+                    for f, s in (scaler_global or {}).items()
+                    if isinstance(s, dict)
+                }
+
+                df_feat = df[features].copy()
+                df_norm = _apply_zscore(df_feat, scaler_stats)
+
+                df_norm = df_norm.head(cap).round(4)
+
+                normalized_samples = df_norm.to_dict(orient="records")
 
             if ENRICHED_METRICS_ENABLED:
                 df_enriched = df
-                if ENRICHED_SAMPLE_CAP and len(df) > ENRICHED_SAMPLE_CAP:
-                    df_enriched = df.sample(n=ENRICHED_SAMPLE_CAP, random_state=42)
+                if ENRICHED_SAMPLE_CAP and len(df_enriched) > ENRICHED_SAMPLE_CAP:
+                    df_enriched = df_enriched.sample(n=ENRICHED_SAMPLE_CAP, random_state=42)
 
                 enriched = _compute_enriched_feature_metrics_df(df_enriched, features)
                 feature_metrics = enriched.get("feature_metrics", {})
                 correlation_matrix = enriched.get("correlation_matrix", {})
-                normalized_feature = enriched.get("normalized_feature", {})
             else:
                 feature_metrics = _compute_feature_metrics_df(df, features, OUTLIER_Z)
 
@@ -782,13 +873,77 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
                     outlier_z=OUTLIER_Z,
                     min_rows_threshold=MIN_ROWS_THRESHOLD,
                 )
-        except Exception:
-            pass
+        else:
+            feature_metrics = {}
+            correlation_matrix = {}
+            stratified_metrics = {}
+
+    except Exception:
+        pass
+
+    # ML TRAINING ΜΕ  NORMALIZATION
+
+    ml_update = None
+    ml_metrics = {}
+
+    if ML_ENABLED and req.label and req.label.strip():
+
+        label_col = req.label.strip()
+
+
+        try:
+            cols_needed = list(features) + [label_col]
+            df_ml = _read_df_for_metrics(req.local_uri, cols_needed, max_rows=200000)
+
+            X = df_ml[features].apply(pd.to_numeric, errors="coerce")
+            y = pd.to_numeric(df_ml[label_col], errors="coerce")
+
+            mask = X.notna().all(axis=1) & y.notna()
+            X = X[mask]
+            y = y[mask].astype(int)
+
+            n_used = int(len(y))
+
+            if n_used >= MIN_ROWS_THRESHOLD:
+                scaler_stats = _scaler_stats_from_df(X, features)
+                Xn = _apply_zscore(X, scaler_stats).fillna(0.0)
+
+
+                clf = SGDClassifier(loss="log_loss", max_iter=1, tol=None)
+
+                clf.partial_fit(
+                    Xn.values,
+                    y.values,
+                    classes=np.array([0, 1])
+                )
+
+                coef = clf.coef_.ravel().astype(float).tolist()
+                intercept = float(clf.intercept_[0])
+
+                p = clf.predict_proba(Xn.values)[:, 1]
+
+                ml_metrics = {
+                    "logloss": float(log_loss(y.values, p)),
+                    "accuracy": float(accuracy_score(y.values, (p >= 0.5).astype(int))),
+                    "n_samples_used": n_used,
+                }
+
+                ml_update = {
+                    "model_type": "logistic_regression",
+                    "features": features,
+                    "coef": coef,
+                    "intercept": intercept,
+                    "n_samples_used": n_used,
+                    "scaler_local": scaler_local
+                }
+
+        except Exception as e:
+            ml_metrics["error"] = str(e)
 
     return {
         "ok": True,
         "row_count": row_count,
-        "update": base.get("update") or {},
+        "update": {},
         "suppressed": False,
         "min_row_threshold": MIN_ROWS_THRESHOLD,
         "metrics": {
@@ -803,7 +958,15 @@ def train_round(req: TrainRoundRequest, x_agent_secret: Optional[str] = Header(d
             "stratified_metrics": stratified_metrics,
             "sufficient_stats": sufficient_stats,
             "correlation_matrix": correlation_matrix,
-            "normalized_feature": normalized_feature,
+            "scaler_global": scaler_global,
+            "scaler_local": scaler_local,
+            "ml_update": ml_update,
+            "ml_metrics": ml_metrics,
+
+            "normalized_samples": normalized_samples,
+            "normalized_samples_cap": NORMALIZED_PREVIEW_ROWS,
+            "normalized_samples_included": bool(req.include_normalized_samples),
+
         },
     }
 

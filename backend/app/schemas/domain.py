@@ -104,7 +104,7 @@ class Node(NodeRegister):
 class DatasetCreate(BaseModel):
 
     name: str = Field(..., min_length=1)
-    description: Optional[str] = Field(default=None, max_length=5000)
+    description: Optional[str] = Field(default=None, max_length=500)
 
     owner_org: str = Field(..., min_length=1)  # enforced στο routes.py από actor.org
     sensitivity_level: SensitivityLevel = SensitivityLevel.low

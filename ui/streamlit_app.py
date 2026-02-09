@@ -786,8 +786,8 @@ def page_nodes() -> None:
     st.dataframe(nodes, use_container_width=True)
 
 
-    if role_norm() == "Hospital":
-        st.caption("If you changed Docker compose service names, ensure node.base_url matches the internal Docker DNS name (e.g., http://bc-fl-hospital-a-agent:9001).")
+    #if role_norm() == "Hospital":
+        #st.caption("If you changed Docker compose service names, ensure node.base_url matches the internal Docker DNS name (e.g., http://bc-fl-hospital-a-agent:9001).")
 
 
 def page_datasets() -> None:
@@ -1261,17 +1261,6 @@ def page_federated_jobs() -> None:
 
     if st.button("Create FL Job", type="primary"):  # Κουμπί δημιουργίας job
         try:
-            missing = []
-            for did in (dataset_ids or []):
-                if not _is_request_approved_for_user(did):
-                    missing.append(_dataset_label_by_id(datasets, did))
-
-            if missing:
-                st.error(
-                    "You need an APPROVED access request for ALL selected datasets:\n\n"
-                    + "\n".join([f"- {x}" for x in missing])
-                )
-                st.stop()
 
             if not selected_features:
                 st.error("Select at least one feature.")  # Validation: πρέπει να έχει επιλεγεί τουλάχιστον 1 feature
@@ -1337,11 +1326,13 @@ def page_federated_jobs() -> None:
         key="fl_display_sections",
     )
 
+
     job_id = st.text_input(
         "Job ID",
         value=st.session_state.get("last_job_id", "") or ""
     )
 
+    include_norm = (role_norm() == "Admin")
     if st.button("Start job", type="secondary"):
         try:
             if not job_id.strip():
@@ -1350,7 +1341,10 @@ def page_federated_jobs() -> None:
 
             # Timer
             t0 = time.perf_counter()
-            job = api_post(f"/fl/jobs/{job_id.strip()}/start", payload={})
+            job = api_post(
+                f"/fl/jobs/{job_id.strip()}/start",
+                payload={"include_normalized_samples": bool(include_norm)},
+            )
             t1 = time.perf_counter()
             ui_duration_sec = round(t1 - t0, 4)
 
@@ -1363,6 +1357,10 @@ def page_federated_jobs() -> None:
             metrics["_ui_call_duration_sec"] = ui_duration_sec
             metrics["_ui_response_size_kb"] = _json_size_kb(job)
             metrics["_ui_metrics_size_kb"] = _json_size_kb(metrics)
+
+            ml_update = (metrics.get("ml_update") or {})
+            scaler_stats = metrics.get("scaler_global") or {}
+
 
             # Telemetry
             if "Telemetry" in sections:
@@ -1411,18 +1409,18 @@ def page_federated_jobs() -> None:
             )
 
             # Downloads
-            st.download_button(
-                "Download job result (JSON)",
-                data=json.dumps(job, ensure_ascii=False, indent=2),
-                file_name=f"job_{job_id.strip()}.json",
-                mime="application/json",
-            )
-            st.download_button(
-                "Download metrics (JSON)",
-                data=json.dumps(metrics, ensure_ascii=False, indent=2),
-                file_name=f"metrics_{job_id.strip()}.json",
-                mime="application/json",
-            )
+            #st.download_button(
+                #"Download job result (JSON)",
+                #data=json.dumps(job, ensure_ascii=False, indent=2),
+                #file_name=f"job_{job_id.strip()}.json",
+                #mime="application/json",
+            #)
+            #st.download_button(
+                #"Download metrics (JSON)",
+                #data=json.dumps(metrics, ensure_ascii=False, indent=2),
+                #file_name=f"metrics_{job_id.strip()}.json",
+                #mime="application/json",
+            #)
 
             if job.get("last_error"):
                 st.error(job.get("last_error"))
@@ -1463,25 +1461,86 @@ def page_federated_jobs() -> None:
                 except Exception:
                     st.json(feature_metrics)
 
-            # Normalized
-            norm_imp = metrics.get("normalized_feature")
-            if "Normalized Feature" in sections and norm_imp:
-                st.subheader("Normalized Feature")
-                st.json(norm_imp)
+            # NORMALIZED VIEW (ADMIN ONLY)
+            if "Normalized Feature" in sections and role_norm() == "Admin":
+                st.subheader("Normalized Records – Admin Verification")
+
+                norm_samples = metrics.get("normalized_samples") or []
+                if not norm_samples:
+                    st.warning("No normalized samples returned from agent.")
+                else:
+                    df_norm = pd.DataFrame(norm_samples)
+                    st.dataframe(df_norm, use_container_width=True)
+
+                    st.markdown("### Validation of Z-Score Normalization (Expected: μ = 0, σ = 1)")
+                    st.caption("Τύπος κανονικοποίησης: z = ( τιμή - μέσος όρος) / τυπική απόκλιση ")
+
+
+                    scaler_global = metrics.get("scaler_global") or {}
+                    suff = (metrics.get("sufficient_stats") or {}).get("feature_sums") or {}
+
+                    check_rows = []
+                    for feat, sg in scaler_global.items():
+                        if feat == "_node_id":
+                            continue
+
+                        n = int(sg.get("n") or 0)
+                        orig_mean = float(sg.get("mean") or 0.0)
+                        orig_std = float(sg.get("std") or 0.0)
+
+                        if n > 1 and orig_std > 0:
+                            mean_z = 0.0
+                            std_z = 1.0
+                        else:
+                            mean_z = None
+                            std_z = None
+
+                        #miss = None
+                        total_rows = None
+                        if isinstance(suff.get(feat), dict):
+                            #miss = int(suff[feat].get("missing") or 0)
+                            total_rows = int(suff[feat].get("total_rows") or 0)
+
+                        check_rows.append({
+                            "feature": feat,
+                            "mean_z (global)": mean_z,
+                            "std_z (global)": std_z,
+                            "n_used": n,
+                            #"orig_mean": round(orig_mean, 6),
+                            #"orig_std": round(orig_std, 6),
+                            #"missing": miss,
+                            #"total_rows": total_rows,
+                        })
+
+                    st.dataframe(pd.DataFrame(check_rows), use_container_width=True)
+
+            elif "Normalized Feature" in sections and role_norm() != "Admin":
+                st.info("Done! Normalized view is available to Admin only.")
 
             # Round trends
             round_trends = metrics.get("round_trends")
-            if "Round Trends" in sections and round_trends:
+
+            if "Round Trends" in sections:
                 st.subheader("Round Trends")
-                if isinstance(round_trends, dict) and round_trends:
-                    rt_df = pd.DataFrame(round_trends)
-                    st.dataframe(rt_df, use_container_width=True)
-                    st.download_button(
-                        "Download round trends (CSV)",
-                        data=rt_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"round_trends_{job_id.strip()}.csv",
-                        mime="text/csv",
-                    )
+
+                if not round_trends:
+                    st.info("Round trends are not available.")
+                else:
+                    if isinstance(round_trends, dict):
+                        round_trends = [round_trends]  # 1-row case
+
+                    if isinstance(round_trends, list):
+                        rt_df = pd.DataFrame(round_trends)
+                        st.dataframe(rt_df, use_container_width=True)
+
+                        st.download_button(
+                            "Download round trends (CSV)",
+                            data=rt_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"round_trends_{job_id.strip()}.csv",
+                            mime="text/csv",
+                        )
+                    else:
+                        st.json(round_trends)
             # Correlation matrix
             corr = metrics.get("correlation_matrix")
 
@@ -1546,121 +1605,6 @@ def page_federated_jobs() -> None:
             st.error(str(e))
 
 
-    # Admin: Compare FL Jobs
-    st.divider()
-    st.subheader("Federated Learning vs Centralized model \n (only admin - for test cases hospital)")
-
-    if role_norm() in ("Admin", "Hospital"):
-
-        try:
-            jobs = api_get("/fl/jobs", params={"limit": 200})
-        except Exception as e:
-            st.error(str(e))
-            jobs = []
-
-        if jobs:
-            def job_label(j: dict) -> str:
-                return (
-                    f"{j.get('created_at', '')} | {j.get('status', '')} | "
-                    f"{j.get('job_id')} | scope={j.get('scope')} | rounds={j.get('rounds')} | "
-                    f"by={j.get('created_by')} ({j.get('created_by_org')})"
-                )
-
-            job_map = {job_label(j): j for j in jobs}
-
-            a_label = st.selectbox("Job (FL)", list(job_map.keys()), key="cmp_job_a")
-            ja = job_map.get(a_label) or {}
-            ja_full = api_get(f"/fl/jobs/{ja.get('job_id')}")
-
-            base = api_post(f"/fl/jobs/{ja.get('job_id')}/baseline", payload={})
-
-            if not base or not isinstance(base, dict):
-                st.error("Baseline endpoint returned empty response.")
-                st.stop()
-
-            if base.get("ok") is False:
-                st.error(base.get("error") or "Baseline failed")
-                st.stop()
-
-            baseline = (base or {}).get("baseline") or {}
-            if not isinstance(baseline, dict) or not baseline:
-                st.error("Baseline response missing 'baseline' payload.")
-                st.stop()
-
-            mb = {
-                "feature_metrics": baseline.get("feature_metrics") or {},
-                "normalized_feature": baseline.get("normalized_feature") or {},
-                "correlation_matrix": baseline.get("correlation_matrix") or {},
-                "privacy": {"suppressed": False, "min_row_threshold": None},
-            }
-
-            ma = (ja_full.get("metrics") or {})
-
-            st.caption("Baseline computed centrally")
-            st.json({
-                "baseline_total_rows": baseline.get("total_rows"),
-                "baseline_datasets": base.get("dataset_ids"),
-            })
-
-            st.divider()
-            st.subheader("Comparison Results")
-
-            st.caption("FL telemetry (A)")
-            st.dataframe(pd.DataFrame([{
-                "participants_count": ma.get("participants_count"),
-                "job_total_duration_sec": ma.get("job_total_duration_sec"),
-                "avg_round_duration_sec": ma.get("avg_round_duration_sec"),
-                "avg_round_payload_kb": ma.get("avg_round_payload_kb"),
-                "last_round_row_count": ma.get("last_round_row_count"),
-            }]), use_container_width=True)
-
-            # Feature metrics comparison
-            fm_cmp = _compare_feature_metrics(ma, mb)
-            if fm_cmp.empty:
-                st.info("No feature_metrics available to compare.")
-            else:
-                st.caption("Compare Feature Metrics")
-                st.dataframe(fm_cmp, use_container_width=True)
-                st.download_button(
-                    "Download feature comparison (CSV)",
-                    data=fm_cmp.to_csv(index=False).encode("utf-8"),
-                    file_name="feature_metrics_compare_A_vs_B.csv",
-                    mime="text/csv",
-                )
-
-                mean_rel = fm_cmp[(fm_cmp["metric"] == "mean") & (fm_cmp["rel_error"].notna())]["rel_error"]
-                miss_abs = fm_cmp[(fm_cmp["metric"] == "missing_rate") & (fm_cmp["abs_diff"].notna())]["abs_diff"]
-
-                agreement = {
-                    "mean_rel_error_avg": None if mean_rel.empty else float(mean_rel.mean()),
-                    "mean_rel_error_max": None if mean_rel.empty else float(mean_rel.max()),
-                    "missing_rate_abs_diff_avg": None if miss_abs.empty else float(miss_abs.mean()),
-                    "features_compared": int(fm_cmp["feature"].nunique()) if "feature" in fm_cmp.columns else 0,
-                }
-                st.caption("Overall Agreement Score (derived)")
-                st.dataframe(pd.DataFrame([agreement]), use_container_width=True)
-
-            # Correlation compare
-            corr_summary = _compare_corr(ma, mb)
-            st.caption("Correlation Matrix Agreement")
-            st.json(corr_summary)
-
-            # Normalized importance compare
-            ni_a = ma.get("normalized_feature") or {}
-            ni_b = mb.get("normalized_feature") or {}
-            k = st.slider("Top-K for importance overlap", min_value=5, max_value=30, value=10, step=1, key="cmp_topk")
-            ni_summary = _topk_overlap(ni_a, ni_b, k=k)
-            st.caption("Normalized Feature (Top-K overlap)")
-            st.json(ni_summary)
-
-
-        else:
-            st.info("No FL jobs found to compare yet.")
-
-    else:
-        st.caption("Comparison is available to Admin only.")
-
-
 def page_runs_history() -> None:
     st.header("History")
     require_login()
@@ -1711,7 +1655,7 @@ def page_smart_contract() -> None:
 
     # receipts
     try:
-        receipts = api_get("/blockchain/receipts", params={"limit": 500})
+        receipts = api_get("/blockchain/receipts", params={"limit": 1000000})
     except Exception as e:
         st.error(str(e))
         st.info("Αν δεν υπάρχει endpoint, έλεγξε ότι το backend έχει GET /blockchain/receipts.")
@@ -1880,44 +1824,26 @@ def page_smart_contract() -> None:
     col1.metric("Total On-chain Events", onchain_count)
     col2.metric("Distinct Event Types", int(fdf["event_type"].nunique()) if "event_type" in fdf.columns else 0)
 
-    ts = fdf["block_timestamp"].dropna() if "block_timestamp" in fdf.columns else pd.Series([], dtype=float)
-    if ts.size >= 2:
-        col3.metric("Blockchain Time Span (sec)", int(ts.max() - ts.min()))
+    try:
+        params = {} if role_norm() == "Admin" else {"mine": 1}
+        runs = api_get("/runs", params=params) or []
+    except Exception:
+        runs = []
+
+    runs_df = pd.DataFrame(runs)
+    if not runs_df.empty and "created_at" in runs_df.columns:
+        rt = pd.to_datetime(runs_df["created_at"], errors="coerce", utc=True).dropna()
+        if rt.size >= 2:
+            delta = rt.max() - rt.min()
+            days = delta.days
+            hours, rem = divmod(delta.seconds, 3600)
+            minutes, seconds = divmod(rem, 60)
+            col3.metric("Time Span - up & running", f"{days}d {hours}h {minutes}m {seconds}s")
+        else:
+            col3.metric("Time Span - up & running", "—")
     else:
-        col3.metric("Blockchain Time Span (sec)", "—")
+        col3.metric("Time Span - up & running", "—")
 
-    #  Smart Contract
-    st.subheader("Smart Contract Evaluation")
-
-    gas = fdf["gas_used"].dropna() if "gas_used" in fdf.columns else pd.Series([], dtype=float)
-    lat = fdf["latency_ms"].dropna() if "latency_ms" in fdf.columns else pd.Series([], dtype=float)
-
-    overall_avg_gas = gas.mean() if gas.size else np.nan
-    overall_p95_latency = lat.quantile(0.95) if lat.size else np.nan
-
-    summary_row = {
-        "avg_gas_used": None if pd.isna(overall_avg_gas) else int(round(overall_avg_gas)),
-        "p95_latency_ms": None if pd.isna(overall_p95_latency) else int(round(overall_p95_latency)),
-        "n_with_gas": int(gas.size),
-        "n_with_latency": int(lat.size),
-    }
-    st.dataframe(pd.DataFrame([summary_row]), use_container_width=True)
-
-    if "event_type" in fdf.columns:
-        per_type = (
-            fdf.groupby("event_type", dropna=False)
-            .agg(
-                n=("event_type", "size"),
-                avg_gas_used=("gas_used", "mean"),
-                p95_latency_ms=("latency_ms", lambda s: s.dropna().quantile(0.95) if s.dropna().size else np.nan),
-            )
-            .reset_index()
-        )
-        per_type["avg_gas_used"] = pd.to_numeric(per_type["avg_gas_used"], errors="coerce").round().astype("Int64")
-        per_type["p95_latency_ms"] = pd.to_numeric(per_type["p95_latency_ms"], errors="coerce").round().astype("Int64")
-
-        st.caption("Per event_type")
-        st.dataframe(per_type, use_container_width=True)
 
 
 def page_settings() -> None:

@@ -8,4 +8,5 @@ pandas
 uvicorn[standard]
 
 pydantic
+scikit-learn
 
